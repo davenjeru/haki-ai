@@ -1,0 +1,119 @@
+terraform {
+  required_version = ">= 1.6"
+
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 6.41.0"
+    }
+  }
+
+  # Remote state — used for prod only.
+  # For local runs use: terraform init -backend=false
+  # Create manually before prod init:
+  #   aws s3api create-bucket --bucket haki-ai-terraform-state --region us-east-1
+  backend "s3" {
+    bucket = "haki-ai-terraform-state"
+    key    = "terraform.tfstate"
+    region = "us-east-1"
+  }
+}
+
+locals {
+  is_local        = var.environment == "local"
+  localstack_url  = "http://localhost:4566"
+}
+
+provider "aws" {
+  region = var.aws_region
+
+  # LocalStack overrides — no-ops when environment = "prod"
+  access_key                  = local.is_local ? "test" : null
+  secret_key                  = local.is_local ? "test" : null
+  skip_credentials_validation = local.is_local
+  skip_metadata_api_check     = local.is_local
+  skip_requesting_account_id  = local.is_local
+  s3_use_path_style           = local.is_local
+
+  dynamic "endpoints" {
+    for_each = local.is_local ? [1] : []
+    content {
+      s3             = local.localstack_url
+      iam            = local.localstack_url
+      lambda         = local.localstack_url
+      apigateway     = local.localstack_url
+      apigatewayv2   = local.localstack_url
+      cloudwatch     = local.localstack_url
+      cloudwatchlogs = local.localstack_url
+      sns            = local.localstack_url
+      sts            = local.localstack_url
+    }
+  }
+}
+
+# ── Storage: S3 data bucket + S3 Vectors bucket ──────────────────────────────
+# S3 Vectors is not supported by LocalStack — skipped locally.
+
+module "storage" {
+  source       = "./modules/storage"
+  project_name = var.project_name
+  aws_region   = var.aws_region
+  is_local     = local.is_local
+}
+
+# ── AI: Bedrock KB + Guardrails ───────────────────────────────────────────────
+# Bedrock is not supported by LocalStack — skipped locally.
+
+module "ai" {
+  count = local.is_local ? 0 : 1
+
+  source             = "./modules/ai"
+  project_name       = var.project_name
+  aws_region         = var.aws_region
+  data_bucket_arn    = module.storage.data_bucket_arn
+  data_bucket_id     = module.storage.data_bucket_id
+  vector_bucket_arn  = module.storage.vector_bucket_arn
+  vector_index_arn   = module.storage.vector_index_arn
+  embedding_model_id = var.embedding_model_id
+}
+
+# ── Compute: Lambda ───────────────────────────────────────────────────────────
+
+module "compute" {
+  source            = "./modules/compute"
+  project_name      = var.project_name
+  aws_region        = var.aws_region
+  knowledge_base_id = local.is_local ? "" : module.ai[0].knowledge_base_id
+  guardrail_id      = local.is_local ? "" : module.ai[0].guardrail_id
+  guardrail_version = local.is_local ? "DRAFT" : module.ai[0].guardrail_version
+  bedrock_model_id  = var.bedrock_model_id
+}
+
+# ── API: API Gateway HTTP ─────────────────────────────────────────────────────
+
+module "api" {
+  source            = "./modules/api"
+  project_name      = var.project_name
+  lambda_arn        = module.compute.lambda_arn
+  lambda_invoke_arn = module.compute.lambda_invoke_arn
+}
+
+# ── Observability: CloudWatch + SNS ──────────────────────────────────────────
+
+module "observability" {
+  source       = "./modules/observability"
+  project_name = var.project_name
+  alert_email  = var.alert_email
+  lambda_name  = module.compute.lambda_name
+}
+
+# ── ML: SageMaker fine-tuning (future) ───────────────────────────────────────
+# SageMaker is not supported by LocalStack — skipped locally.
+
+module "ml" {
+  count = local.is_local ? 0 : 1
+
+  source         = "./modules/ml"
+  project_name   = var.project_name
+  data_bucket_id = module.storage.data_bucket_id
+}

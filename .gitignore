@@ -1,0 +1,28 @@
+# Environment secrets
+.env
+.env.*
+
+# Node
+**/node_modules/
+**/dist/
+
+# Pipeline
+pipeline/.tmp-chunks/
+pipeline/*.traineddata
+
+# Terraform
+infra/.terraform/
+infra/.terraform.lock.hcl
+infra/*.tfstate
+infra/*.tfstate.backup
+infra/terraform.tfvars.local
+infra/local_backend_override.tf
+
+# LocalStack volume (certs + license)
+pipeline/volume/
+
+# Claude Code local settings
+.claude/
+
+# macOS
+.DS_Store
