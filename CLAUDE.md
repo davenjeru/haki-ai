@@ -8,8 +8,9 @@ in English and Swahili, with citations to specific Act, Chapter, and Section.
 - Frontend: React (chat UI + citation renderer + language-aware placeholder)
 - Backend: Python Lambda (agent orchestrator)
 - IaC: Terraform (modular)
-- RAG pipeline: Bedrock Knowledge Bases (managed — handles chunking +
-  embedding + retrieval + generation in one retrieve_and_generate call)
+- RAG pipeline: custom chunking pipeline (TypeScript, LiteParse OCR + Haiku
+  LLM extraction) → S3 pre-chunked .txt files → Bedrock KB (embedding +
+  retrieval + generation via retrieve_and_generate)
 - Vector store: S3 Vectors (storage backend for Bedrock KB)
 - Raw data: S3 standard bucket (law PDFs + fine-tuning data)
 - Language detection: AWS Comprehend (returns english / swahili / mixed)
@@ -53,8 +54,13 @@ haki-ai/
         └── observability/ # CloudWatch metrics, alarms, dashboard, SNS [TODO]
 
 ## Key architecture decisions
-- Bedrock KB handles the full RAG pipeline (no custom chunking/embedding
-  code needed). One retrieve_and_generate call does everything.
+- Chunking is fully custom (not delegated to Bedrock KB):
+    1. LiteParse OCR extracts raw text per page in 10-page batches
+    2. Claude Haiku (Bedrock InvokeModel) identifies section boundaries per page
+    3. assembleChunks() walks pages in order, accumulating lines per section
+    4. splitToSegments() splits long sections at paragraph breaks (~500 tokens)
+    5. Pre-chunked .txt files + .txt.metadata.json sidecars uploaded to S3
+  Bedrock KB only handles embedding + retrieval + generation (retrieve_and_generate).
 - S3 Vectors is the vector store backend for Bedrock KB (serverless,
   cheapest option, GA December 2025)
 - Bedrock KB syncs from pre-chunked .txt files in S3 via start_ingestion_job
@@ -146,13 +152,17 @@ Adding a new AWS service: add make_X() to clients.py, add XAdapter if LocalStack
 limitations apply, inject into lambda_handler — no changes to business logic files.
 
 ## Local testing strategy
-- LocalStack Pro: Lambda, API Gateway, S3, CloudWatch, IAM
-  Note: Comprehend DetectDominantLanguage not yet implemented in LocalStack Pro
-  v2026.3.x — ComprehendAdapter falls back to "english" locally
+- LocalStack Pro (paid): Lambda, API Gateway, S3, CloudWatch, IAM
+  - Start: localstack start -d (no docker-compose — not set up)
+  - Comprehend DetectDominantLanguage not yet implemented in LocalStack Pro
+    v2026.3.x — ComprehendAdapter falls back to "english" locally
 - Bedrock always hits real AWS (LocalStack does not support it)
+- S3 Vectors skipped locally (count = 0 in Terraform) — no ChromaDB replacement
 - ENV=local switches all boto3 clients to LocalStack endpoint
 - LOCALSTACK_HOSTNAME env var (injected by LocalStack into Lambda) resolves
   the correct internal Docker hostname; falls back to localhost for direct calls
+- Pipeline uses AWS_ENDPOINT_URL=http://localhost:4566 for LocalStack S3;
+  Bedrock endpoint explicitly hardcoded in llm-extract.ts to bypass it
 - uv manages Python dependencies (Python 3.12)
 
 ## CloudWatch custom metrics (namespace: HakiAI)
