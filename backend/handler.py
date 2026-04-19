@@ -3,22 +3,30 @@ Haki AI — Lambda handler.
 
 Entry point for the chat API. Orchestrates:
   1. Language detection (Comprehend)
-  2. System prompt construction          [stub]
-  3. RAG via Bedrock KB                  [stub]
-  4. Guardrail block check               [stub]
-  5. Citation extraction                 [stub]
-  6. CloudWatch metrics                  [stub]
+  2. System prompt construction (prompts.py)
+  3. RAG via Bedrock KB or local ChromaDB (rag.py)
+  4. Guardrail block check (rag.py)
+  5. Citation extraction (citations.py)
+  6. CloudWatch metrics (metrics.py)
   7. Return response JSON
 
-Environment concerns (LocalStack endpoints, fallbacks) live in
+Environment concerns (LocalStack endpoints, adapter selection) live in
 config.py, clients.py, and adapters.py — not here.
 """
 
 import json
+import os
 
 from config import load_config
-from clients import make_comprehend
-from adapters import ComprehendAdapter
+from clients import make_comprehend, make_bedrock_agent_runtime, make_bedrock_runtime, make_cloudwatch
+from adapters import ComprehendAdapter, LocalRAGAdapter, BedrockRAGAdapter, StubRAGAdapter
+from prompts import build_system_prompt
+from rag import retrieve_and_generate, check_guardrail_block, blocked_response
+from citations import extract_citations
+from metrics import emit_metrics, now_ms, elapsed_ms
+
+# Path to the local ChromaDB store — relative to this file
+_VECTORSTORE_PATH = os.path.join(os.path.dirname(__file__), ".local-vectorstore")
 
 # ── Language detection ────────────────────────────────────────────────────────
 
@@ -52,6 +60,28 @@ def detect_language(text: str, comprehend: ComprehendAdapter) -> str:
     # Unknown language or no result — default to English so the user gets a response
     return "english"
 
+
+# ── RAG adapter factory ───────────────────────────────────────────────────────
+
+def _make_rag_adapter(config, in_process: bool = False):
+    """
+    Returns the appropriate RAG adapter for the current environment:
+
+      in_process=True  + is_local  → LocalRAGAdapter (ChromaDB on host filesystem)
+      in_process=False + is_local  → StubRAGAdapter  (Lambda inside Docker — no ChromaDB)
+      is_local=False               → BedrockRAGAdapter (real Bedrock KB)
+
+    in_process is set to True only by test_e2e_local.py, which runs the
+    handler logic directly without going through the Lambda Docker container.
+    """
+    if config.is_local:
+        if in_process:
+            bedrock_runtime = make_bedrock_runtime(config)
+            return LocalRAGAdapter(bedrock_runtime, config.embedding_model_id, _VECTORSTORE_PATH)
+        return StubRAGAdapter()
+    return BedrockRAGAdapter(make_bedrock_agent_runtime(config), config)
+
+
 # ── Lambda handler ────────────────────────────────────────────────────────────
 
 def lambda_handler(event, context):
@@ -61,10 +91,12 @@ def lambda_handler(event, context):
     Expected request body: { "message": "<user question>" }
     Response body:         { "response": str, "citations": list, "language": str, "blocked": bool }
     """
-    try:
-        config = load_config()
-        comprehend = ComprehendAdapter(make_comprehend(config), config.is_local)
+    config = load_config()
+    cloudwatch = make_cloudwatch(config)
+    start = now_ms()
+    language = "english"  # default for metrics if we fail before detection
 
+    try:
         body = json.loads(event.get("body") or "{}")
         user_message = body.get("message", "").strip()
 
@@ -72,35 +104,64 @@ def lambda_handler(event, context):
             return _response(400, {"error": "message is required"})
 
         # Step 1: Language detection
+        comprehend = ComprehendAdapter(make_comprehend(config), config.is_local)
         language = detect_language(user_message, comprehend)
 
-        # Step 2: Build system prompt  [TODO]
-        # system_prompt = build_system_prompt(language)
+        # Step 2: Build system prompt
+        system_prompt = build_system_prompt(language)
 
-        # Step 3: Retrieve and generate via Bedrock KB  [TODO]
-        # bedrock = make_bedrock_agent_runtime(config)
-        # rag_result = retrieve_and_generate(user_message, system_prompt, config, bedrock)
+        # Step 3: Retrieve and generate
+        rag_adapter = _make_rag_adapter(config)
+        rag_result = retrieve_and_generate(
+            user_message, system_prompt, config.bedrock_model_id, rag_adapter
+        )
 
-        # Step 4: Check for guardrail block  [TODO]
-        # if rag_result["stopReason"] == "guardrail_intervened":
-        #     return _response(200, {"response": BILINGUAL_REFUSAL, "citations": [], "language": language, "blocked": True})
+        # Step 4: Check for guardrail block
+        if check_guardrail_block(rag_result):
+            emit_metrics(
+                cloudwatch,
+                language=language,
+                latency_ms=elapsed_ms(start),
+                blocked=True,
+                citations=[],
+            )
+            return _response(200, {
+                "response": blocked_response(language),
+                "citations": [],
+                "language": language,
+                "blocked": True,
+            })
 
-        # Step 5: Extract citations  [TODO]
-        # citations = extract_citations(rag_result)
+        # Step 5: Extract citations
+        citations = extract_citations(rag_result)
+        response_text = rag_result.get("output", {}).get("text", "")
 
-        # Step 6: Emit CloudWatch metrics  [TODO]
-        # cloudwatch = make_cloudwatch(config)
-        # emit_metrics(cloudwatch, language, latency_ms, blocked=False)
+        # Step 6: Emit metrics
+        emit_metrics(
+            cloudwatch,
+            language=language,
+            latency_ms=elapsed_ms(start),
+            blocked=False,
+            citations=citations,
+        )
 
         return _response(200, {
-            "response": "",       # filled in by step 3
-            "citations": [],      # filled in by step 5
+            "response": response_text,
+            "citations": citations,
             "language": language,
             "blocked": False,
         })
 
     except Exception as err:
         print(f"Unhandled error: {err}")
+        emit_metrics(
+            cloudwatch,
+            language=language,
+            latency_ms=elapsed_ms(start),
+            blocked=False,
+            citations=[],
+            failed=True,
+        )
         return _response(500, {"error": "Internal server error"})
 
 

@@ -45,7 +45,7 @@ class ComprehendAdapter:
             raise
 
 
-# ── Local RAG adapter ─────────────────────────────────────────────────────────
+# ── RAG adapters ─────────────────────────────────────────────────────────────
 
 _S3_BUCKET = "haki-ai-data"
 _CHUNKS_PREFIX = "processed-chunks/"
@@ -180,3 +180,73 @@ class LocalRAGAdapter:
             )
             parts.append(f"[{header}]\n{doc}")
         return "\n\n---\n\n".join(parts)
+
+
+class StubRAGAdapter:
+    """
+    Minimal RAG adapter for LocalStack Lambda invocations.
+
+    LocalStack Lambda cannot access the host filesystem (no ChromaDB store)
+    and chromadb is not installed in the Lambda zip. This stub lets the full
+    handler pipeline run end-to-end inside Docker so the Lambda wiring,
+    env vars, CloudWatch metrics, and response shape can all be verified
+    without real retrieval.
+
+    For actual RAG quality testing, use LocalRAGAdapter directly via
+    test_e2e_local.py (runs in-process, not inside Docker).
+    """
+
+    def retrieve_and_generate(
+        self, query: str, system_prompt: str, model_id: str
+    ) -> dict:
+        return {
+            "output": {
+                "text": (
+                    "[LocalStack stub] RAG not available inside Docker. "
+                    "Run ENV=local uv run test_e2e_local.py for real RAG testing."
+                )
+            },
+            "citations": [],
+            "stopReason": "end_turn",
+        }
+
+
+class BedrockRAGAdapter:
+    """
+    Wraps the bedrock-agent-runtime boto3 client so it shares the same
+    retrieve_and_generate interface as LocalRAGAdapter.
+
+    rag.py calls retrieve_and_generate() on whichever adapter it receives —
+    it never needs to know which environment it's in.
+    """
+
+    def __init__(self, client, config):
+        self._client = client
+        self._config = config
+
+    def retrieve_and_generate(
+        self, query: str, system_prompt: str, model_id: str
+    ) -> dict:
+        """
+        Calls Bedrock KB retrieve_and_generate and returns the raw response.
+        The response already matches the expected shape:
+          { "output": { "text" }, "citations": [...], "stopReason": str }
+        """
+        response = self._client.retrieve_and_generate(
+            input={"text": query},
+            retrieveAndGenerateConfiguration={
+                "type": "KNOWLEDGE_BASE",
+                "knowledgeBaseConfiguration": {
+                    "knowledgeBaseId": self._config.knowledge_base_id,
+                    "modelArn": f"arn:aws:bedrock:{self._config.aws_region}::foundation-model/{model_id}",
+                    "generationConfiguration": {
+                        "promptTemplate": {"textPromptTemplate": system_prompt},
+                        "guardrailConfiguration": {
+                            "guardrailId": self._config.guardrail_id,
+                            "guardrailVersion": self._config.guardrail_version,
+                        },
+                    },
+                },
+            },
+        )
+        return response
