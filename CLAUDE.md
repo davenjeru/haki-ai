@@ -26,7 +26,15 @@ in English and Swahili, with citations to specific Act, Chapter, and Section.
 haki-ai/
 ├── frontend/
 ├── backend/
-│   └── handler.py
+│   ├── handler.py         # Lambda entry point — thin orchestrator
+│   ├── config.py          # single source of truth for env vars
+│   ├── clients.py         # boto3 factory (make_comprehend, make_bedrock, etc.)
+│   ├── adapters.py        # client wrappers (papers over LocalStack limitations)
+│   ├── prompts.py         # system prompt builder (step 2)           [TODO]
+│   ├── rag.py             # retrieve_and_generate + guardrail (steps 3–4) [TODO]
+│   ├── citations.py       # citation extraction (step 5)             [TODO]
+│   ├── metrics.py         # CloudWatch metric emission (step 6)      [TODO]
+│   └── test_language_detection.py
 ├── pipeline/              # local data prep (TypeScript, LiteParse)
 │   └── src/
 ├── data/
@@ -38,11 +46,11 @@ haki-ai/
     ├── terraform.tfvars
     └── modules/
         ├── storage/       # S3 standard + S3 Vectors buckets
-        ├── compute/       # Lambda + IAM role
-        ├── api/           # API Gateway HTTP + CORS + CloudWatch logs
+        ├── compute/       # Lambda + IAM role  ✓ implemented
+        ├── api/           # API Gateway HTTP + CORS + CloudWatch logs [TODO]
         ├── ai/            # Bedrock KB + Guardrails
         ├── ml/            # SageMaker qLoRA job
-        └── observability/ # CloudWatch metrics, alarms, dashboard, SNS
+        └── observability/ # CloudWatch metrics, alarms, dashboard, SNS [TODO]
 
 ## Key architecture decisions
 - Bedrock KB handles the full RAG pipeline (no custom chunking/embedding
@@ -126,12 +134,26 @@ aws s3 rm s3://haki-ai-data/processed-chunks/{shortId}/.complete
 aws s3 rm s3://haki-ai-data/processed-chunks/ --recursive --exclude "*" --include "{shortId}-*"
 aws s3 rm s3://haki-ai-data/page-extractions/{shortId}/ --recursive
 
+## Backend module structure (backend/)
+Three separation layers keep handler.py a thin orchestrator:
+- config.py   — load_config() reads all env vars once; returns frozen Config dataclass
+- clients.py  — make_comprehend(), make_bedrock_agent_runtime(), make_cloudwatch()
+                 all boto3 clients constructed here, nowhere else
+- adapters.py — ComprehendAdapter wraps client; handles LocalStack "not supported"
+                 fallback so business logic is environment-agnostic
+
+Adding a new AWS service: add make_X() to clients.py, add XAdapter if LocalStack
+limitations apply, inject into lambda_handler — no changes to business logic files.
+
 ## Local testing strategy
-- LocalStack (free): Lambda, API Gateway, S3, CloudWatch, IAM, Comprehend
-- ChromaDB (in-memory): replaces S3 Vectors locally
-- Mock retrieve_and_generate when ENV=local
-- docker-compose: localstack + chromadb + backend services
-- ENV variable switches between local mocks and real AWS
+- LocalStack Pro: Lambda, API Gateway, S3, CloudWatch, IAM
+  Note: Comprehend DetectDominantLanguage not yet implemented in LocalStack Pro
+  v2026.3.x — ComprehendAdapter falls back to "english" locally
+- Bedrock always hits real AWS (LocalStack does not support it)
+- ENV=local switches all boto3 clients to LocalStack endpoint
+- LOCALSTACK_HOSTNAME env var (injected by LocalStack into Lambda) resolves
+  the correct internal Docker hostname; falls back to localhost for direct calls
+- uv manages Python dependencies (Python 3.12)
 
 ## CloudWatch custom metrics (namespace: HakiAI)
 - SuccessfulRequests, FailedRequests
@@ -161,6 +183,32 @@ aws s3 rm s3://haki-ai-data/page-extractions/{shortId}/ --recursive
 - Real API: POST to VITE_API_BASE_URL + VITE_CHAT_PATH (/chat default)
 
 ## Current status
-Pipeline complete (both scripts written and tested).
-Constitution page extraction running; throttling handled with backoff + S3 cache.
-Next: review extracted chunks in S3, then build backend handler.py.
+
+### Done
+- Pipeline (both scripts) complete, tested, and verified locally against LocalStack
+  - 1196 chunks + metadata sidecars across all 3 laws
+  - Resume-safe: S3 cache for Haiku extractions, .complete markers, local temp dir
+- Pipeline refactored: dead code removed, module-level doc comments added
+- Backend architecture established (config / clients / adapters / handler pattern)
+- Backend step 1 complete: language detection via Comprehend with mock + LocalStack tests
+- infra/modules/compute implemented: Lambda (Python 3.12) + IAM role + policy
+  - Permissions: CloudWatch Logs, Comprehend, CloudWatch metrics, Bedrock
+  - archive_file zips backend/ excluding .venv, tests, uv files
+- End-to-end Lambda invocation verified on LocalStack Pro
+
+### Remaining — backend
+- prompts.py   step 2: build_system_prompt(language)
+- rag.py       steps 3–4: retrieve_and_generate + guardrail block check
+- citations.py step 5: extract_citations(rag_response)
+- metrics.py   step 6: emit_metrics() → HakiAI CloudWatch namespace
+- Wire all steps into handler.py; LocalStack end-to-end test
+
+### Remaining — infrastructure
+- infra/modules/api/main.tf        API Gateway HTTP + CORS + Lambda integration
+- infra/modules/observability/     CloudWatch alarms + dashboard + SNS email alerts
+
+### Remaining — prod deployment
+- make apply → recreate prod infra on real AWS
+- npm run dev + npm run chunk → pipeline against real S3
+- start_ingestion_job → index chunks into Bedrock KB
+- Connect frontend: set VITE_API_BASE_URL to API Gateway URL
