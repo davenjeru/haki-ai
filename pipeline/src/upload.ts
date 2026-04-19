@@ -4,6 +4,7 @@ import { CHUNKS_PREFIX, PAGE_IMAGES_PREFIX, PAGE_TEXT_PREFIX, RAW_PREFIX, S3_BUC
 import { Chunk } from "./chunk.js";
 import { s3 } from "./s3-client.js";
 
+/** Uploads the original law PDF to raw-laws/{filename}. */
 export async function uploadRawPdf(filepath: string, filename: string): Promise<void> {
   const body = await readFile(filepath);
   await s3.send(new PutObjectCommand({
@@ -15,6 +16,7 @@ export async function uploadRawPdf(filepath: string, filename: string): Promise<
   console.log(`    uploaded: s3://${S3_BUCKET}/${RAW_PREFIX}${filename}`);
 }
 
+/** Uploads a single-page PDF to page-images/{shortId}/page-N.pdf. Returns the S3 key. */
 export async function uploadPagePdf(
   pdfBytes: Uint8Array,
   lawShortId: string,
@@ -30,6 +32,7 @@ export async function uploadPagePdf(
   return key;
 }
 
+/** Uploads raw OCR text to page-text/{shortId}/page-N.txt. Returns the S3 key. */
 export async function uploadPageText(
   text: string,
   lawShortId: string,
@@ -47,6 +50,15 @@ export async function uploadPageText(
 
 const UPLOAD_CONCURRENCY = 20;
 
+/**
+ * Uploads processed chunks to S3 in batches of UPLOAD_CONCURRENCY.
+ * Each chunk produces two S3 objects:
+ *   - {chunkId}.txt              — the body text, read by Bedrock KB
+ *   - {chunkId}.txt.metadata.json — Bedrock KB sidecar with citation attributes
+ *
+ * @param onChunkUploaded - called after each successful upload (used to write .done markers)
+ * @param totalForProgress - total chunk count for the progress bar (may differ from chunks.length on resume)
+ */
 export async function uploadChunks(
   chunks: Chunk[],
   onChunkUploaded?: (chunkId: string) => Promise<void>,

@@ -1,3 +1,16 @@
+/**
+ * Assembles Chunk[] from Haiku LLM extraction results.
+ *
+ * Algorithm:
+ *   Walk pages in order. For each page:
+ *     - Update the current chapter/part label if a new one starts on this page.
+ *     - If no section headers are present, append all lines to the open node.
+ *     - If section headers are present, flush lines up to each header into the
+ *       previous node, then open a new node for each section found.
+ *   After all pages, flush the final open node.
+ *   Convert each node to one or more Chunks by joining its lines and splitting
+ *   at paragraph boundaries if the text exceeds CHUNK_CHAR_LIMIT.
+ */
 import type { Chunk } from "./chunk.js";
 import {
   splitToSegments,

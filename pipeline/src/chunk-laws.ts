@@ -1,3 +1,18 @@
+/**
+ * Script 2 of 2: LLM-assisted chunking pipeline.
+ *
+ * For each law:
+ *   1. Check S3 for a .complete marker — skip entirely if already done.
+ *   2. Fetch raw page texts from S3 (written by run.ts).
+ *   3. Call Haiku (Claude Haiku via Bedrock) on each page to extract section
+ *      headers. Results are cached in S3 so interrupted runs can resume.
+ *   4. Assemble text chunks from the extraction results (see assemble.ts).
+ *   5. Upload each chunk as {chunkId}.txt + {chunkId}.txt.metadata.json to S3.
+ *   6. Write a .complete marker, then delete the local temp dir.
+ *
+ * Run with: npm run chunk          (real AWS S3 + Bedrock)
+ *           npm run chunk:local    (LocalStack S3, real Bedrock)
+ */
 import {
   GetObjectCommand,
   HeadObjectCommand,

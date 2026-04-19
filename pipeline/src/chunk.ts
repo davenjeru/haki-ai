@@ -1,222 +1,43 @@
-import { CHUNK_CHAR_LIMIT, LawConfig } from "./config.js";
+import { CHUNK_CHAR_LIMIT } from "./config.js";
 
-export interface PageSpan {
-  pageNum: number;
-  startChar: number; // byte offset of this page's start in the joined batch string
-}
-
+// Shape of a processed text chunk ready for S3 upload and Bedrock KB ingestion.
 export interface Chunk {
   chunkId: string;
-  source: string;
-  chapter: string;
-  section: string;
-  title: string;
-  text: string;
-  startPage: number;     // PDF page this section header was found on
-  pageImageKey?: string; // S3 key for the extracted page PDF; set by run.ts
+  source: string;        // full law name, e.g. "Employment Act 2007"
+  chapter: string;       // e.g. "Part III — Termination of Contract"
+  section: string;       // e.g. "Section 40"
+  title: string;         // e.g. "Termination of employment"
+  text: string;          // body text for this chunk
+  startPage: number;     // PDF page where this section header appears
+  pageImageKey?: string; // S3 key for the page PDF, used in the citation carousel
 }
 
-interface Node {
-  chapter: string;
-  section: string;
-  title: string;
-  lines: string[];
-  pageNum: number;
-}
+// ── Noise filtering ───────────────────────────────────────────────────────────
 
-export function chunkText(fullText: string, law: LawConfig, pageSpans: PageSpan[]): Chunk[] {
-  const nodes =
-    law.structure === "constitution"
-      ? parseConstitution(fullText, pageSpans)
-      : parseAct(fullText, pageSpans);
-
-  const chunks: Chunk[] = [];
-
-  for (const node of nodes) {
-    const body = node.lines.join("\n").trim();
-    if (body.length < 50) continue;
-
-    const segments = splitToSegments(body);
-
-    segments.forEach((text, i) => {
-      const suffix = segments.length > 1 ? `-${i + 1}` : "";
-      const base = slugify(`${law.shortId}-${node.chapter}-${node.section}`);
-      chunks.push({
-        chunkId: `${base}${suffix}`,
-        source: law.name,
-        chapter: node.chapter,
-        section: node.section,
-        title: node.title,
-        text,
-        startPage: node.pageNum,
-      });
-    });
-  }
-
-  return chunks;
-}
-
-// ── Constitution of Kenya: CHAPTER headers + Article numbers ─────────────────
-
-function parseConstitution(text: string, pageSpans: PageSpan[]): Node[] {
-  const nodes: Node[] = [];
-  let currentChapter = "Preamble";
-  let currentSection = "Preamble";  // fix #7: pre-section text gets flushed
-  let currentTitle = "";
-  let currentPage = pageSpans[0]?.pageNum ?? 1;
-  let buffer: string[] = [];
-  let charOffset = 0;
-
-  const flush = () => {
-    if (currentSection && buffer.length) {
-      nodes.push({
-        chapter: currentChapter,
-        section: currentSection,
-        title: currentTitle,
-        lines: buffer,
-        pageNum: currentPage,
-      });
-    }
-    buffer = [];
-  };
-
-  for (const line of text.split("\n")) {
-    // fix #6: skip running page headers and bare page numbers
-    if (isNoise(line)) {
-      charOffset += line.length + 1;
-      continue;
-    }
-
-    // fix #4 + #5: capture the full title after the dash, normalize word-form to numeral
-    const chapterMatch = line.match(
-      /^(CHAPTER\s+(?:ONE|TWO|THREE|FOUR|FIVE|SIX|SEVEN|EIGHT|NINE|TEN|ELEVEN|TWELVE|THIRTEEN|FOURTEEN|FIFTEEN|SIXTEEN|SEVENTEEN|EIGHTEEN|\d+))(?:\s*[—–-]\s*(.+))?\s*$/i
-    );
-    // fix #1 + #2: \s+ instead of \s{1,4}, [A-Za-z] instead of [A-Z]
-    const articleMatch = line.match(/^(\d{1,3})\.\s+([A-Za-z][^\n]{2,80})\s*$/);
-
-    if (chapterMatch) {
-      flush();
-      const num = normalizeChapterNum(chapterMatch[1]);   // fix #4
-      const title = chapterMatch[2]?.trim();              // fix #5
-      currentChapter = title ? `${num} — ${title}` : num;
-    } else if (articleMatch) {
-      flush();
-      currentPage = pageForOffset(charOffset, pageSpans);
-      currentSection = `Article ${articleMatch[1]}`;
-      currentTitle = articleMatch[2].trim().replace(/\.$/, "");
-    } else {
-      buffer.push(line);
-    }
-    charOffset += line.length + 1;
-  }
-  flush();
-  return nodes;
-}
-
-// ── Acts (Employment, Land): PART headers + Section numbers ──────────────────
-
-function parseAct(text: string, pageSpans: PageSpan[]): Node[] {
-  const nodes: Node[] = [];
-  let currentPart = "Preliminary";
-  let currentSection = "Preliminary"; // fix #7: pre-section text gets flushed
-  let currentTitle = "";
-  let currentPage = pageSpans[0]?.pageNum ?? 1;
-  let buffer: string[] = [];
-  let charOffset = 0;
-
-  const flush = () => {
-    if (currentSection && buffer.length) {
-      nodes.push({
-        chapter: currentPart,
-        section: currentSection,
-        title: currentTitle,
-        lines: buffer,
-        pageNum: currentPage,
-      });
-    }
-    buffer = [];
-  };
-
-  for (const line of text.split("\n")) {
-    // fix #6: skip running page headers and bare page numbers
-    if (isNoise(line)) {
-      charOffset += line.length + 1;
-      continue;
-    }
-
-    // fix #3: drop [A-Z]+ alternative (too broad); fix #5: capture title after dash
-    const partMatch = line.match(
-      /^(PART\s+(?:[IVXLCDM]+|\d+))(?:\s*[—–-]\s*(.+))?\s*$/i
-    );
-    // fix #1 + #2: \s+ instead of \s{1,4}, [A-Za-z] instead of [A-Z]
-    const sectionMatch = line.match(/^(\d{1,3})\.\s+([A-Za-z][^\n]{2,80})\s*$/);
-
-    if (partMatch) {
-      flush();
-      const part = normalizePart(partMatch[1]);           // fix #4 (roman → kept as-is, already correct)
-      const title = partMatch[2]?.trim();                 // fix #5
-      currentPart = title ? `${part} — ${title}` : part;
-    } else if (sectionMatch) {
-      flush();
-      currentPage = pageForOffset(charOffset, pageSpans);
-      currentSection = `Section ${sectionMatch[1]}`;
-      currentTitle = sectionMatch[2].trim().replace(/\.$/, "");
-    } else {
-      buffer.push(line);
-    }
-    charOffset += line.length + 1;
-  }
-  flush();
-  return nodes;
-}
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-// filter out OCR noise — running headers and bare page numbers
+/**
+ * Returns true for OCR noise lines that should be excluded from chunk text:
+ * bare page numbers, "Laws of Kenya" running headers, act name headers, etc.
+ * Blank lines are kept because they mark paragraph boundaries.
+ */
 export function isNoise(line: string): boolean {
   const t = line.trim();
-  if (!t) return false; // keep blank lines (paragraph breaks)
-  if (/^\d+$/.test(t)) return true;                          // bare page number
-  if (/^—\s*\d+\s*—$/.test(t)) return true;                 // — 42 —
+  if (!t) return false;                                            // keep blank lines
+  if (/^\d+$/.test(t)) return true;                               // bare page number
+  if (/^—\s*\d+\s*—$/.test(t)) return true;                      // — 42 —
   if (/^laws of kenya$/i.test(t)) return true;
-  if (/^no\.\s*\d+\s+of\s+\d{4}$/i.test(t)) return true;   // No. 6 of 2012
-  // running header: "Constitution of Kenya, 2010" or "Constitution of Kenya, 2010    21"
+  if (/^no\.\s*\d+\s+of\s+\d{4}$/i.test(t)) return true;        // No. 6 of 2012
+  // Running header pattern: "Constitution of Kenya 2010", "Employment Act, 2007   21"
   if (/^(constitution|employment act|land act)[,\s]*(of kenya)?[,\s]*\d{4}/i.test(t)) return true;
   return false;
 }
 
-function pageForOffset(offset: number, spans: PageSpan[]): number {
-  let page = spans[0]?.pageNum ?? 1;
-  for (const s of spans) {
-    if (offset >= s.startChar) page = s.pageNum;
-    else break;
-  }
-  return page;
-}
+// ── Chunk splitting ───────────────────────────────────────────────────────────
 
-// fix #4: convert word-form chapter numbers to "Chapter N"
-const WORD_TO_NUM: Record<string, string> = {
-  ONE: "1", TWO: "2", THREE: "3", FOUR: "4", FIVE: "5",
-  SIX: "6", SEVEN: "7", EIGHT: "8", NINE: "9", TEN: "10",
-  ELEVEN: "11", TWELVE: "12", THIRTEEN: "13", FOURTEEN: "14",
-  FIFTEEN: "15", SIXTEEN: "16", SEVENTEEN: "17", EIGHTEEN: "18",
-};
-
-export function normalizeChapterNum(raw: string): string {
-  const clean = raw.replace(/\s+/g, " ").trim();
-  // Split on the first dash/em-dash separator to separate number word from title
-  const dashIdx = clean.search(/[—–-]/);
-  const numPart = (dashIdx >= 0 ? clean.slice(0, dashIdx) : clean)
-    .replace(/^CHAPTER\s+/i, "").trim().toUpperCase();
-  const title = dashIdx >= 0 ? clean.slice(dashIdx + 1).trim() : undefined;
-  const num = WORD_TO_NUM[numPart] ?? numPart;
-  return title ? `Chapter ${num} — ${title}` : `Chapter ${num}`;
-}
-
-export function normalizePart(raw: string): string {
-  return raw.replace(/\s+/g, " ").trim().replace(/^PART /i, "Part ");
-}
-
+/**
+ * Splits body text into segments no larger than CHUNK_CHAR_LIMIT (~500 tokens).
+ * Breaks at paragraph boundaries (double newlines) to preserve readability.
+ * Returns a single-element array if the text fits within the limit.
+ */
 export function splitToSegments(text: string): string[] {
   if (text.length <= CHUNK_CHAR_LIMIT) return [text];
 
@@ -236,6 +57,43 @@ export function splitToSegments(text: string): string[] {
   return segments;
 }
 
+// ── Slug generation ───────────────────────────────────────────────────────────
+
+/** Converts a string to a URL/S3-safe slug (lowercase, hyphens, no special chars). */
 export function slugify(str: string): string {
   return str.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+}
+
+// ── Chapter/Part label normalization ─────────────────────────────────────────
+
+// The Constitution uses English word-form chapter numbers (ONE, TWO, …).
+// We convert them to numerals so chunk IDs are consistent ("Chapter 4", not "Chapter FOUR").
+const WORD_TO_NUM: Record<string, string> = {
+  ONE: "1", TWO: "2", THREE: "3", FOUR: "4", FIVE: "5",
+  SIX: "6", SEVEN: "7", EIGHT: "8", NINE: "9", TEN: "10",
+  ELEVEN: "11", TWELVE: "12", THIRTEEN: "13", FOURTEEN: "14",
+  FIFTEEN: "15", SIXTEEN: "16", SEVENTEEN: "17", EIGHTEEN: "18",
+};
+
+/**
+ * Normalizes a raw Constitution chapter heading to "Chapter N — Title".
+ * Handles both word-form ("CHAPTER FOUR — THE BILL OF RIGHTS") and
+ * numeral form ("CHAPTER 4 — THE BILL OF RIGHTS").
+ */
+export function normalizeChapterNum(raw: string): string {
+  const clean = raw.replace(/\s+/g, " ").trim();
+  const dashIdx = clean.search(/[—–-]/);
+  const numPart = (dashIdx >= 0 ? clean.slice(0, dashIdx) : clean)
+    .replace(/^CHAPTER\s+/i, "").trim().toUpperCase();
+  const title = dashIdx >= 0 ? clean.slice(dashIdx + 1).trim() : undefined;
+  const num = WORD_TO_NUM[numPart] ?? numPart;
+  return title ? `Chapter ${num} — ${title}` : `Chapter ${num}`;
+}
+
+/**
+ * Normalizes a raw Act part heading to title-case "Part" prefix.
+ * e.g. "PART III — TERMINATION OF CONTRACT" → "Part III — TERMINATION OF CONTRACT"
+ */
+export function normalizePart(raw: string): string {
+  return raw.replace(/\s+/g, " ").trim().replace(/^PART /i, "Part ");
 }
