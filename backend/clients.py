@@ -39,6 +39,15 @@ def make_bedrock_agent_runtime(config: Config):
     return boto3.client("bedrock-agent-runtime", region_name=config.aws_region)
 
 
+def make_bedrock_runtime(config: Config):
+    """
+    Bedrock Runtime client for direct model invocation (InvokeModel).
+    Used locally for Titan embeddings + Claude generation via LocalRAGAdapter.
+    Always points at real AWS — LocalStack does not support Bedrock.
+    """
+    return boto3.client("bedrock-runtime", region_name=config.aws_region)
+
+
 def make_cloudwatch(config: Config):
     """
     CloudWatch client for emitting custom HakiAI metrics.

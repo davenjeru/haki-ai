@@ -18,6 +18,7 @@ class Config:
     guardrail_id: str
     guardrail_version: str
     bedrock_model_id: str
+    embedding_model_id: str
 
 
 def load_config() -> Config:
@@ -40,4 +41,7 @@ def load_config() -> Config:
         guardrail_id=os.environ.get("GUARDRAIL_ID", ""),
         guardrail_version=os.environ.get("GUARDRAIL_VERSION", "DRAFT"),
         bedrock_model_id=os.environ.get("BEDROCK_MODEL_ID", ""),
+        embedding_model_id=os.environ.get(
+            "EMBEDDING_MODEL_ID", "amazon.titan-embed-text-v2:0"
+        ),
     )

@@ -70,7 +70,8 @@ data "archive_file" "lambda_zip" {
     ".venv",
     "__pycache__",
     "*.pyc",
-    "test_*.py",
+    "test_*.py",   # test runners — committed to git, not needed in Lambda
+    "*_local.py",  # local-only scripts — committed to git, not needed in Lambda
     "pyproject.toml",
     "uv.lock",
   ]

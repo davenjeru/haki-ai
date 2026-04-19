@@ -30,12 +30,13 @@ haki-ai/
 │   ├── handler.py         # Lambda entry point — thin orchestrator
 │   ├── config.py          # single source of truth for env vars
 │   ├── clients.py         # boto3 factory (make_comprehend, make_bedrock, etc.)
-│   ├── adapters.py        # client wrappers (papers over LocalStack limitations)
+│   ├── adapters.py        # client wrappers + LocalRAGAdapter (local ChromaDB RAG)
+│   ├── ingest_local.py    # one-time local ingestion: S3 chunks → ChromaDB [local only]
 │   ├── prompts.py         # system prompt builder (step 2)           [TODO]
 │   ├── rag.py             # retrieve_and_generate + guardrail (steps 3–4) [TODO]
 │   ├── citations.py       # citation extraction (step 5)             [TODO]
 │   ├── metrics.py         # CloudWatch metric emission (step 6)      [TODO]
-│   └── test_language_detection.py
+│   └── test_language_detection.py  # language detection test runner  [local only]
 ├── pipeline/              # local data prep (TypeScript, LiteParse)
 │   └── src/
 ├── data/
@@ -132,8 +133,11 @@ haki-ai/
     page-extractions/   ← cached Haiku JSON extractions (resume support)
     processed-chunks/   ← .txt + .txt.metadata.json for Bedrock KB
 
-### Run order
+### Run order (prod)
 terraform apply → npm run dev → npm run chunk → start_ingestion_job
+
+### Run order (local)
+localstack start -d → terraform apply → npm run dev → npm run chunk → ENV=local uv run ingest_local.py
 
 ### To re-process a law
 aws s3 rm s3://haki-ai-data/processed-chunks/{shortId}/.complete
@@ -143,10 +147,12 @@ aws s3 rm s3://haki-ai-data/page-extractions/{shortId}/ --recursive
 ## Backend module structure (backend/)
 Three separation layers keep handler.py a thin orchestrator:
 - config.py   — load_config() reads all env vars once; returns frozen Config dataclass
-- clients.py  — make_comprehend(), make_bedrock_agent_runtime(), make_cloudwatch()
-                 all boto3 clients constructed here, nowhere else
+- clients.py  — make_comprehend(), make_bedrock_agent_runtime(), make_bedrock_runtime(),
+                 make_cloudwatch() — all boto3 clients constructed here, nowhere else
 - adapters.py — ComprehendAdapter wraps client; handles LocalStack "not supported"
-                 fallback so business logic is environment-agnostic
+                 fallback so business logic is environment-agnostic.
+                 LocalRAGAdapter mimics Bedrock KB retrieve_and_generate locally
+                 using ChromaDB + Bedrock InvokeModel (Titan embed + Claude generate).
 
 Adding a new AWS service: add make_X() to clients.py, add XAdapter if LocalStack
 limitations apply, inject into lambda_handler — no changes to business logic files.
@@ -157,7 +163,10 @@ limitations apply, inject into lambda_handler — no changes to business logic f
   - Comprehend DetectDominantLanguage not yet implemented in LocalStack Pro
     v2026.3.x — ComprehendAdapter falls back to "english" locally
 - Bedrock always hits real AWS (LocalStack does not support it)
-- S3 Vectors skipped locally (count = 0 in Terraform) — no ChromaDB replacement
+- Bedrock KB / S3 Vectors replaced locally by ChromaDB + Titan embed via LocalRAGAdapter
+  - Persistent store at backend/.local-vectorstore/ (gitignored, excluded from Lambda zip)
+  - Populated by: ENV=local uv run ingest_local.py (run once after npm run chunk)
+  - 1196 chunks embedded and verified locally
 - ENV=local switches all boto3 clients to LocalStack endpoint
 - LOCALSTACK_HOSTNAME env var (injected by LocalStack into Lambda) resolves
   the correct internal Docker hostname; falls back to localhost for direct calls
@@ -203,8 +212,12 @@ limitations apply, inject into lambda_handler — no changes to business logic f
 - Backend step 1 complete: language detection via Comprehend with mock + LocalStack tests
 - infra/modules/compute implemented: Lambda (Python 3.12) + IAM role + policy
   - Permissions: CloudWatch Logs, Comprehend, CloudWatch metrics, Bedrock
-  - archive_file zips backend/ excluding .venv, tests, uv files
+  - archive_file zips backend/ excluding .venv, test_*.py, *_local.py, uv files
 - End-to-end Lambda invocation verified on LocalStack Pro
+- Local vector store implemented: ChromaDB + Titan Embed Text v2 via LocalRAGAdapter
+  - ingest_local.py reads chunks from LocalStack S3, embeds via real Bedrock, upserts to ChromaDB
+  - 1196 chunks ingested and verified (0 errors)
+  - LocalRAGAdapter.retrieve_and_generate() returns Bedrock KB-compatible response shape
 
 ### Remaining — backend
 - prompts.py   step 2: build_system_prompt(language)

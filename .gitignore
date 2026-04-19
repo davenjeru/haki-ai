@@ -28,6 +28,7 @@ pipeline/volume/
 # Python (uv)
 backend/.venv/
 backend/__pycache__/
+backend/.local-vectorstore/
 
 # macOS
 .DS_Store

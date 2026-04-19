@@ -9,9 +9,9 @@ Two modes:
             Set ENV=local for LocalStack, or AWS_PROFILE for real AWS.
 
 Usage:
-  python3 test_language_detection.py --mock
-  ENV=local python3 test_language_detection.py
-  AWS_PROFILE=my-profile python3 test_language_detection.py
+  uv run test_language_detection.py --mock
+  ENV=local uv run test_language_detection.py
+  AWS_PROFILE=my-profile uv run test_language_detection.py
 """
 
 import os
