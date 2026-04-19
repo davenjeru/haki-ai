@@ -17,12 +17,17 @@ infra/*.tfstate
 infra/*.tfstate.backup
 infra/terraform.tfvars.local
 infra/local_backend_override.tf
+infra/modules/compute/lambda.zip
 
 # LocalStack volume (certs + license)
 pipeline/volume/
 
 # Claude Code local settings
 .claude/
+
+# Python (uv)
+backend/.venv/
+backend/__pycache__/
 
 # macOS
 .DS_Store

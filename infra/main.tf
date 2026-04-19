@@ -83,6 +83,7 @@ module "compute" {
   source            = "./modules/compute"
   project_name      = var.project_name
   aws_region        = var.aws_region
+  environment       = var.environment
   knowledge_base_id = local.is_local ? "" : module.ai[0].knowledge_base_id
   guardrail_id      = local.is_local ? "" : module.ai[0].guardrail_id
   guardrail_version = local.is_local ? "DRAFT" : module.ai[0].guardrail_version
