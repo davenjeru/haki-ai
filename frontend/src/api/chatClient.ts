@@ -87,13 +87,17 @@ async function mockSendMessage(message: string): Promise<ChatResponse> {
   }
 }
 
+// undefined  → VITE_API_BASE_URL not set at all → mock mode
+// ""         → VITE_API_BASE_URL set to empty   → real API via Vite dev proxy (/chat)
+// "https://…" → absolute URL                    → real API called directly (production)
 function apiBase(): string | undefined {
   const raw = import.meta.env.VITE_API_BASE_URL
-  return typeof raw === 'string' && raw.trim() ? raw.trim().replace(/\/$/, '') : undefined
+  if (raw === undefined) return undefined
+  return raw.trim().replace(/\/$/, '')
 }
 
 function isMockMode(): boolean {
-  return import.meta.env.VITE_USE_MOCK === 'true' || !apiBase()
+  return import.meta.env.VITE_USE_MOCK === 'true' || apiBase() === undefined
 }
 
 /**

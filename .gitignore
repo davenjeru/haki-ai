@@ -1,6 +1,7 @@
-# Environment secrets
+# Environment secrets — keep .env.example files committed
 .env
-.env.*
+.env.local
+.env.*.local
 
 # Node
 **/node_modules/
