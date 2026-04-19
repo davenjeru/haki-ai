@@ -19,7 +19,7 @@ import os
 
 from config import load_config
 from clients import make_comprehend, make_bedrock_agent_runtime, make_bedrock_runtime, make_cloudwatch
-from adapters import ComprehendAdapter, LocalRAGAdapter, BedrockRAGAdapter, StubRAGAdapter
+from adapters import ComprehendAdapter, LocalRAGAdapter, BedrockRAGAdapter
 from prompts import build_system_prompt
 from rag import retrieve_and_generate, check_guardrail_block, blocked_response
 from citations import extract_citations
@@ -67,18 +67,26 @@ def _make_rag_adapter(config, in_process: bool = False):
     """
     Returns the appropriate RAG adapter for the current environment:
 
-      in_process=True  + is_local  → LocalRAGAdapter (ChromaDB on host filesystem)
-      in_process=False + is_local  → StubRAGAdapter  (Lambda inside Docker — no ChromaDB)
-      is_local=False               → BedrockRAGAdapter (real Bedrock KB)
+      is_local + chroma_host set  → LocalRAGAdapter (HTTP client → ChromaDB server)
+      is_local + in_process=True  → LocalRAGAdapter (in-process PersistentClient)
+      is_local=False              → BedrockRAGAdapter (real Bedrock KB)
 
-    in_process is set to True only by test_e2e_local.py, which runs the
-    handler logic directly without going through the Lambda Docker container.
+    chroma_host is injected as a Lambda env var (CHROMA_HOST) pointing at
+    host.docker.internal so the container can reach the ChromaDB HTTP server
+    running on the host machine. This mirrors the prod path where Lambda
+    calls Bedrock KB over the network to reach S3 Vectors.
+
+    in_process=True is used only by test_e2e_local.py (runs outside Docker).
     """
     if config.is_local:
-        if in_process:
-            bedrock_runtime = make_bedrock_runtime(config)
-            return LocalRAGAdapter(bedrock_runtime, config.embedding_model_id, _VECTORSTORE_PATH)
-        return StubRAGAdapter()
+        bedrock_runtime = make_bedrock_runtime(config)
+        return LocalRAGAdapter(
+            bedrock_runtime,
+            config.embedding_model_id,
+            _VECTORSTORE_PATH,
+            chroma_host=config.chroma_host if not in_process else "",
+            chroma_port=config.chroma_port,
+        )
     return BedrockRAGAdapter(make_bedrock_agent_runtime(config), config)
 
 

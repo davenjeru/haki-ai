@@ -1,8 +1,9 @@
 """
 End-to-end local RAG test runner.
 
-Invokes lambda_handler directly in-process (not via LocalStack Docker) so
-that LocalRAGAdapter can access the host ChromaDB store at .local-vectorstore/.
+Invokes lambda_handler directly in-process (not via LocalStack Docker). Runs
+with CHROMA_HOST="" so LocalRAGAdapter uses chromadb.PersistentClient to
+access .local-vectorstore/ directly — no ChromaDB HTTP server required.
 
 This tests the full 6-step pipeline:
   1. Language detection (Comprehend → LocalStack fallback)
@@ -25,16 +26,13 @@ import json
 import os
 import sys
 
-# Tell handler to use LocalRAGAdapter (ChromaDB) instead of StubRAGAdapter
+# Tell handler to use LocalRAGAdapter with in-process PersistentClient.
+# CHROMA_HOST="" (default) → chromadb.PersistentClient on .local-vectorstore/
 os.environ["ENV"] = "local"
 os.environ.setdefault("BEDROCK_MODEL_ID", "us.anthropic.claude-haiku-4-5-20251001-v1:0")
+os.environ.setdefault("CHROMA_HOST", "")
 
 sys.path.insert(0, os.path.dirname(__file__))
-
-# Patch _make_rag_adapter before importing handler so it uses in_process=True
-import handler as _handler_module
-_original_make_rag_adapter = _handler_module._make_rag_adapter
-_handler_module._make_rag_adapter = lambda config: _original_make_rag_adapter(config, in_process=True)
 
 from handler import lambda_handler
 

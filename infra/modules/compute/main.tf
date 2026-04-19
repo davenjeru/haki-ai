@@ -98,6 +98,8 @@ resource "aws_lambda_function" "handler" {
       GUARDRAIL_ID      = var.guardrail_id
       GUARDRAIL_VERSION = var.guardrail_version
       BEDROCK_MODEL_ID  = var.bedrock_model_id
+      CHROMA_HOST       = var.chroma_host
+      CHROMA_PORT       = var.chroma_port
     }
   }
 }

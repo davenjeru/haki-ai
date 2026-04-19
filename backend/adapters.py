@@ -10,9 +10,21 @@ Business logic functions receive adapters, not raw boto3 clients.
 LocalRAGAdapter is a local-only composite that mimics the Bedrock KB
 retrieve_and_generate interface using ChromaDB + Bedrock InvokeModel.
 It is never instantiated in the Lambda environment.
+
+When chroma_host is set, LocalRAGAdapter uses _ChromaHttpClient to query
+the ChromaDB HTTP server over the network (same pattern as Bedrock KB →
+S3 Vectors in prod). This lets the Lambda container reach ChromaDB running
+on the host machine via host.docker.internal without needing the chromadb
+package (and its native hnswlib binary) inside the Lambda zip.
+
+When chroma_host is empty, LocalRAGAdapter falls back to ChromaDB
+PersistentClient for in-process access (test_e2e_local.py path).
 """
 
 import json
+import urllib.error
+import urllib.parse
+import urllib.request
 
 from botocore.exceptions import ClientError
 
@@ -52,30 +64,102 @@ _CHUNKS_PREFIX = "processed-chunks/"
 _CHROMA_COLLECTION = "haki_chunks"
 _TOP_K = 5
 
+_CHROMA_TENANT = "default_tenant"
+_CHROMA_DB = "default_database"
+
+
+class _ChromaHttpClient:
+    """
+    Minimal ChromaDB v2 HTTP client using only stdlib urllib.
+
+    No chromadb package required — works inside the Lambda zip without
+    native dependencies. Mirrors the query interface used by ChromaDB's
+    own PersistentClient so LocalRAGAdapter can swap between the two.
+    """
+
+    def __init__(self, host: str, port: int):
+        self._base = f"http://{host}:{port}/api/v2/tenants/{_CHROMA_TENANT}/databases/{_CHROMA_DB}"
+        self._collection_id: str | None = None
+
+    def _request(self, method: str, path: str, body: dict | None = None) -> dict:
+        url = f"{self._base}{path}"
+        data = json.dumps(body).encode() if body is not None else None
+        req = urllib.request.Request(
+            url,
+            data=data,
+            method=method,
+            headers={"Content-Type": "application/json"} if data else {},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return json.loads(resp.read())
+        except urllib.error.HTTPError as err:
+            raise RuntimeError(f"ChromaDB {method} {path} → HTTP {err.code}: {err.read().decode()}") from err
+
+    def _get_collection_id(self) -> str:
+        if self._collection_id is None:
+            collections = self._request("GET", "/collections")
+            for col in collections:
+                if col.get("name") == _CHROMA_COLLECTION:
+                    self._collection_id = col["id"]
+                    break
+            if self._collection_id is None:
+                raise RuntimeError(f"ChromaDB collection '{_CHROMA_COLLECTION}' not found. Run ingest_local.py first.")
+        return self._collection_id
+
+    def query(
+        self,
+        query_embeddings: list[list[float]],
+        n_results: int = 5,
+        include: list[str] | None = None,
+    ) -> dict:
+        col_id = self._get_collection_id()
+        payload: dict = {
+            "query_embeddings": query_embeddings,
+            "n_results": n_results,
+            "include": include or ["documents", "metadatas", "distances"],
+        }
+        return self._request("POST", f"/collections/{col_id}/query", payload)
+
 
 class LocalRAGAdapter:
     """
     Mimics the Bedrock KB retrieve_and_generate interface for local testing.
 
-    Uses ChromaDB (persistent, cosine similarity) as the vector store and
-    Bedrock InvokeModel for both Titan embeddings and Claude generation.
-    Embeddings always hit real AWS — Bedrock is never available in LocalStack.
+    Uses ChromaDB as the vector store and Bedrock InvokeModel for both Titan
+    embeddings and Claude generation. Embeddings always hit real AWS.
+
+    Two storage backends (selected at construction time):
+      - HTTP  (chroma_host set): queries ChromaDB HTTP server via _ChromaHttpClient.
+               Used by Lambda-in-Docker — no chromadb package needed in the zip.
+               host.docker.internal:8000 reaches the host from the container.
+      - In-process (chroma_host empty): uses chromadb.PersistentClient directly.
+               Used by test_e2e_local.py running outside Docker.
 
     Returns a dict that matches the Bedrock KB response shape so that
     citations.py and handler.py can treat local and prod identically.
     """
 
-    def __init__(self, bedrock_runtime, embed_model: str, vectorstore_path: str):
-        import chromadb  # local-only — not available in Lambda runtime
-
+    def __init__(
+        self,
+        bedrock_runtime,
+        embed_model: str,
+        vectorstore_path: str,
+        chroma_host: str = "",
+        chroma_port: int = 8000,
+    ):
         self._bedrock = bedrock_runtime
         self._embed_model = embed_model
 
-        chroma = chromadb.PersistentClient(path=vectorstore_path)
-        self._collection = chroma.get_or_create_collection(
-            name=_CHROMA_COLLECTION,
-            metadata={"hnsw:space": "cosine"},
-        )
+        if chroma_host:
+            self._collection = _ChromaHttpClient(chroma_host, chroma_port)
+        else:
+            import chromadb  # local-only — not available in Lambda runtime
+            chroma = chromadb.PersistentClient(path=vectorstore_path)
+            self._collection = chroma.get_or_create_collection(
+                name=_CHROMA_COLLECTION,
+                metadata={"hnsw:space": "cosine"},
+            )
 
     # ── Public interface ──────────────────────────────────────────────────────
 
@@ -144,7 +228,14 @@ class LocalRAGAdapter:
             contentType="application/json",
             accept="application/json",
         )
-        return json.loads(response["body"].read())["embedding"]
+        raw = response["body"].read()
+        try:
+            return json.loads(raw)["embedding"]
+        except (json.JSONDecodeError, KeyError) as err:
+            raise RuntimeError(
+                f"Bedrock embed call returned unexpected response "
+                f"(model={self._embed_model}): {raw[:200]!r}"
+            ) from err
 
     def _invoke_claude(
         self, model_id: str, system_prompt: str, user_content: str
@@ -181,34 +272,6 @@ class LocalRAGAdapter:
             parts.append(f"[{header}]\n{doc}")
         return "\n\n---\n\n".join(parts)
 
-
-class StubRAGAdapter:
-    """
-    Minimal RAG adapter for LocalStack Lambda invocations.
-
-    LocalStack Lambda cannot access the host filesystem (no ChromaDB store)
-    and chromadb is not installed in the Lambda zip. This stub lets the full
-    handler pipeline run end-to-end inside Docker so the Lambda wiring,
-    env vars, CloudWatch metrics, and response shape can all be verified
-    without real retrieval.
-
-    For actual RAG quality testing, use LocalRAGAdapter directly via
-    test_e2e_local.py (runs in-process, not inside Docker).
-    """
-
-    def retrieve_and_generate(
-        self, query: str, system_prompt: str, model_id: str
-    ) -> dict:
-        return {
-            "output": {
-                "text": (
-                    "[LocalStack stub] RAG not available inside Docker. "
-                    "Run ENV=local uv run test_e2e_local.py for real RAG testing."
-                )
-            },
-            "citations": [],
-            "stopReason": "end_turn",
-        }
 
 
 class BedrockRAGAdapter:

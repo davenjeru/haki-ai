@@ -5,3 +5,11 @@ variable "knowledge_base_id" { type = string }
 variable "guardrail_id"      { type = string }
 variable "guardrail_version" { type = string }
 variable "bedrock_model_id"  { type = string }
+variable "chroma_host" {
+  type    = string
+  default = ""
+}
+variable "chroma_port" {
+  type    = string
+  default = "8000"
+}

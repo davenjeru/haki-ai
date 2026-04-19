@@ -17,7 +17,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(__file__))
 
 from handler import detect_language, lambda_handler, _make_rag_adapter
-from adapters import ComprehendAdapter, StubRAGAdapter
+from adapters import ComprehendAdapter
 from prompts import build_system_prompt, BILINGUAL_REFUSAL
 from rag import check_guardrail_block, blocked_response
 from citations import extract_citations
@@ -220,17 +220,25 @@ class TestExtractCitations(unittest.TestCase):
 
 # ── lambda_handler ────────────────────────────────────────────────────────────
 
+class _FakeRAGAdapter:
+    """Minimal RAG stub for unit tests — no AWS calls made."""
+    def retrieve_and_generate(self, query, system_prompt, model_id):
+        return {
+            "output": {"text": "This is a test response."},
+            "citations": [],
+            "stopReason": "end_turn",
+        }
+
+
 class TestLambdaHandler(unittest.TestCase):
     """
-    Tests lambda_handler directly using StubRAGAdapter.
+    Tests lambda_handler directly using a fake RAG adapter.
     LocalStack not required.
     """
 
     def setUp(self):
         # Patch adapters so no AWS calls are made
         import handler as h
-        import adapters as a
-        import metrics as m
 
         self._orig_make_comprehend = h.make_comprehend
         self._orig_make_cloudwatch = h.make_cloudwatch
@@ -249,8 +257,8 @@ class TestLambdaHandler(unittest.TestCase):
 
         h.make_cloudwatch = lambda config: _FakeCloudWatch()
 
-        # RAG: stub
-        h._make_rag_adapter = lambda config: StubRAGAdapter()
+        # RAG: fake adapter
+        h._make_rag_adapter = lambda config: _FakeRAGAdapter()
 
     def tearDown(self):
         import handler as h

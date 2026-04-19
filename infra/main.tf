@@ -88,6 +88,8 @@ module "compute" {
   guardrail_id      = local.is_local ? "" : module.ai[0].guardrail_id
   guardrail_version = local.is_local ? "DRAFT" : module.ai[0].guardrail_version
   bedrock_model_id  = var.bedrock_model_id
+  chroma_host       = var.chroma_host
+  chroma_port       = var.chroma_port
 }
 
 # ── API: API Gateway HTTP ─────────────────────────────────────────────────────

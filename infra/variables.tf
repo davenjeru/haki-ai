@@ -37,3 +37,15 @@ variable "embedding_model_id" {
   type        = string
   default     = "amazon.titan-embed-text-v2:0"
 }
+
+variable "chroma_host" {
+  description = "ChromaDB HTTP server host for local Lambda → ChromaDB access. Empty in prod."
+  type        = string
+  default     = ""
+}
+
+variable "chroma_port" {
+  description = "ChromaDB HTTP server port"
+  type        = string
+  default     = "8000"
+}
