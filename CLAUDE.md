@@ -30,13 +30,16 @@ haki-ai/
 │   ├── handler.py         # Lambda entry point — thin orchestrator
 │   ├── config.py          # single source of truth for env vars
 │   ├── clients.py         # boto3 factory (make_comprehend, make_bedrock, etc.)
-│   ├── adapters.py        # client wrappers + LocalRAGAdapter (local ChromaDB RAG)
+│   ├── adapters.py        # ComprehendAdapter + LocalRAGAdapter + BedrockRAGAdapter
+│   ├── prompts.py         # system prompt builder (step 2)
+│   ├── rag.py             # retrieve_and_generate + guardrail check (steps 3–4)
+│   ├── citations.py       # citation extraction (step 5)
+│   ├── metrics.py         # CloudWatch metric emission (step 6)
 │   ├── ingest_local.py    # one-time local ingestion: S3 chunks → ChromaDB [local only]
-│   ├── prompts.py         # system prompt builder (step 2)           [TODO]
-│   ├── rag.py             # retrieve_and_generate + guardrail (steps 3–4) [TODO]
-│   ├── citations.py       # citation extraction (step 5)             [TODO]
-│   ├── metrics.py         # CloudWatch metric emission (step 6)      [TODO]
-│   └── test_language_detection.py  # language detection test runner  [local only]
+│   ├── server_local.py    # local HTTP server for frontend dev (port 8080) [local only]
+│   ├── test_unit.py       # 35 unit tests — no AWS required [local only]
+│   ├── test_e2e_local.py  # in-process end-to-end RAG test [local only]
+│   └── test_language_detection.py  # language detection test runner [local only]
 ├── pipeline/              # local data prep (TypeScript, LiteParse)
 │   └── src/
 ├── data/
@@ -48,11 +51,11 @@ haki-ai/
     ├── terraform.tfvars
     └── modules/
         ├── storage/       # S3 standard + S3 Vectors buckets
-        ├── compute/       # Lambda + IAM role  ✓ implemented
-        ├── api/           # API Gateway HTTP + CORS + CloudWatch logs [TODO]
+        ├── compute/       # Lambda + IAM role
+        ├── api/           # API Gateway HTTP + CORS + CloudWatch logs
         ├── ai/            # Bedrock KB + Guardrails
         ├── ml/            # SageMaker qLoRA job
-        └── observability/ # CloudWatch metrics, alarms, dashboard, SNS [TODO]
+        └── observability/ # CloudWatch alarms, dashboard, SNS alerts
 
 ## Key architecture decisions
 - Chunking is fully custom (not delegated to Bedrock KB):
@@ -147,32 +150,61 @@ aws s3 rm s3://haki-ai-data/page-extractions/{shortId}/ --recursive
 ## Backend module structure (backend/)
 Three separation layers keep handler.py a thin orchestrator:
 - config.py   — load_config() reads all env vars once; returns frozen Config dataclass
+                 Fields: is_local, localstack_endpoint, aws_region, knowledge_base_id,
+                 guardrail_id, guardrail_version, bedrock_model_id, embedding_model_id,
+                 chroma_host, chroma_port
 - clients.py  — make_comprehend(), make_bedrock_agent_runtime(), make_bedrock_runtime(),
                  make_cloudwatch() — all boto3 clients constructed here, nowhere else
-- adapters.py — ComprehendAdapter wraps client; handles LocalStack "not supported"
-                 fallback so business logic is environment-agnostic.
-                 LocalRAGAdapter mimics Bedrock KB retrieve_and_generate locally
-                 using ChromaDB + Bedrock InvokeModel (Titan embed + Claude generate).
+- adapters.py — ComprehendAdapter: wraps Comprehend, falls back to "english" on LocalStack
+                 LocalRAGAdapter: mimics Bedrock KB retrieve_and_generate locally via
+                   ChromaDB + Titan embed + Claude InvokeModel. Selects backend at init:
+                   - CHROMA_HOST set → _ChromaHttpClient (stdlib urllib, no chromadb package)
+                   - CHROMA_HOST empty → chromadb.PersistentClient (in-process)
+                 BedrockRAGAdapter: wraps bedrock-agent-runtime retrieve_and_generate
 
 Adding a new AWS service: add make_X() to clients.py, add XAdapter if LocalStack
 limitations apply, inject into lambda_handler — no changes to business logic files.
 
 ## Local testing strategy
+
+### Two local paths — choose based on what you're testing
+
+**Path A — server_local.py (recommended for frontend dev + RAG quality)**
+- Runs handler in-process on the host machine with real AWS credentials
+- ChromaDB PersistentClient reads .local-vectorstore/ directly (no HTTP server needed)
+- Port 8080; set LOCAL_API_URL=http://localhost:8080 in frontend/.env.local
+- Start: `cd backend && ENV=local uv run server_local.py`
+- Full stack: Terminal 1 above, Terminal 2: `cd frontend && npm run dev`
+- Verified working: 5 citations returned from Employment Act on real questions
+
+**Path B — LocalStack Lambda (for infrastructure/wiring verification)**
+- Lambda runs inside Docker with fake credentials (LocalStack injects test/test)
+- CHROMA_HOST=host.docker.internal lets container reach ChromaDB HTTP server on host
+- ChromaDB must be running: `uv run chroma run --path .local-vectorstore --port 8000 --host 0.0.0.0`
+- Bedrock InvokeModel fails inside Lambda because LocalStack overrides credentials —
+  use Path A for real RAG responses
+- Invoke via: `make local-apply` then invoke Lambda through LocalStack API Gateway
+
+### Local infrastructure
 - LocalStack Pro (paid): Lambda, API Gateway, S3, CloudWatch, IAM
   - Start: localstack start -d (no docker-compose — not set up)
   - Comprehend DetectDominantLanguage not yet implemented in LocalStack Pro
     v2026.3.x — ComprehendAdapter falls back to "english" locally
 - Bedrock always hits real AWS (LocalStack does not support it)
-- Bedrock KB / S3 Vectors replaced locally by ChromaDB + Titan embed via LocalRAGAdapter
-  - Persistent store at backend/.local-vectorstore/ (gitignored, excluded from Lambda zip)
-  - Populated by: ENV=local uv run ingest_local.py (run once after npm run chunk)
-  - 1196 chunks embedded and verified locally
-- ENV=local switches all boto3 clients to LocalStack endpoint
+- Local vector store at backend/.local-vectorstore/ (gitignored, excluded from Lambda zip)
+  - Populated once: ENV=local uv run ingest_local.py (reads from LocalStack S3)
+  - 1196 chunks embedded and verified
+- ENV=local switches boto3 clients to LocalStack endpoint
 - LOCALSTACK_HOSTNAME env var (injected by LocalStack into Lambda) resolves
   the correct internal Docker hostname; falls back to localhost for direct calls
 - Pipeline uses AWS_ENDPOINT_URL=http://localhost:4566 for LocalStack S3;
   Bedrock endpoint explicitly hardcoded in llm-extract.ts to bypass it
 - uv manages Python dependencies (Python 3.12)
+
+### Test scripts (all committed to git, excluded from Lambda zip)
+- `uv run test_unit.py`        — 35 unit tests, no AWS required, runs in 0.001s
+- `ENV=local uv run test_e2e_local.py` — in-process end-to-end RAG (real Bedrock)
+- `ENV=local uv run test_language_detection.py` — language detection against LocalStack
 
 ## CloudWatch custom metrics (namespace: HakiAI)
 - SuccessfulRequests, FailedRequests
@@ -188,6 +220,7 @@ limitations apply, inject into lambda_handler — no changes to business logic f
 ## Terraform state
 - Remote backend: S3 bucket haki-ai-terraform-state
 - Create manually before terraform init
+- Local: make local-apply (uses local.tfstate, no remote backend)
 
 ## Frontend (frontend/)
 - React + Vite + Tailwind v4 (@tailwindcss/vite plugin)
@@ -198,8 +231,11 @@ limitations apply, inject into lambda_handler — no changes to business logic f
   CitationBlock, PageCarousel
 - PageCarousel: displays single-page PDFs from page-images/ S3 prefix
   as a citation carousel (useState, no extra deps)
-- Mock mode: VITE_USE_MOCK=true or no VITE_API_BASE_URL set
-- Real API: POST to VITE_API_BASE_URL + VITE_CHAT_PATH (/chat default)
+- API modes (chatClient.ts):
+  - VITE_USE_MOCK=true or VITE_API_BASE_URL unset → mock mode (no backend)
+  - VITE_API_BASE_URL="" (empty) + LOCAL_API_URL set → real API via Vite proxy
+  - VITE_API_BASE_URL="https://..." → real API called directly (production)
+- Local dev: set LOCAL_API_URL=http://localhost:8080 in frontend/.env.local
 
 ## Current status
 
@@ -208,30 +244,33 @@ limitations apply, inject into lambda_handler — no changes to business logic f
   - 1196 chunks + metadata sidecars across all 3 laws
   - Resume-safe: S3 cache for Haiku extractions, .complete markers, local temp dir
 - Pipeline refactored: dead code removed, module-level doc comments added
-- Backend architecture established (config / clients / adapters / handler pattern)
-- Backend step 1 complete: language detection via Comprehend with mock + LocalStack tests
-- infra/modules/compute implemented: Lambda (Python 3.12) + IAM role + policy
-  - Permissions: CloudWatch Logs, Comprehend, CloudWatch metrics, Bedrock
+- Backend fully implemented — all 6 handler steps wired:
+  - prompts.py: build_system_prompt(language) — english / swahili / mixed variants
+  - rag.py: retrieve_and_generate() + check_guardrail_block() — env-agnostic
+  - citations.py: extract_citations() — deduplicates by chunkId, includes pageImageKey
+  - metrics.py: emit_metrics() → HakiAI CloudWatch namespace
+  - handler.py: thin orchestrator, all steps wired, CORS headers
+- Backend architecture: config / clients / adapters / handler separation
+- Local RAG adapter implemented: ChromaDB + Titan Embed Text v2 + Claude InvokeModel
+  - LocalRAGAdapter uses _ChromaHttpClient (stdlib urllib) when CHROMA_HOST is set
+  - Falls back to chromadb.PersistentClient when CHROMA_HOST is empty (in-process)
+  - Returns Bedrock KB-compatible response shape; citations.py/handler.py env-agnostic
+  - 1196 chunks ingested and verified; end-to-end RAG verified (5 citations on test query)
+- server_local.py: in-process HTTP server on port 8080 for frontend local dev
+  - No LocalStack required; runs with real AWS credentials on host
+  - Verified: real RAG responses with citations returned to frontend
+- infra/modules/compute: Lambda (Python 3.12) + IAM role + policy
+  - CHROMA_HOST=host.docker.internal + CHROMA_PORT=8000 in Lambda env vars
   - archive_file zips backend/ excluding .venv, test_*.py, *_local.py, uv files
-- End-to-end Lambda invocation verified on LocalStack Pro
-- Local vector store implemented: ChromaDB + Titan Embed Text v2 via LocalRAGAdapter
-  - ingest_local.py reads chunks from LocalStack S3, embeds via real Bedrock, upserts to ChromaDB
-  - 1196 chunks ingested and verified (0 errors)
-  - LocalRAGAdapter.retrieve_and_generate() returns Bedrock KB-compatible response shape
-
-### Remaining — backend
-- prompts.py   step 2: build_system_prompt(language)
-- rag.py       steps 3–4: retrieve_and_generate + guardrail block check
-- citations.py step 5: extract_citations(rag_response)
-- metrics.py   step 6: emit_metrics() → HakiAI CloudWatch namespace
-- Wire all steps into handler.py; LocalStack end-to-end test
-
-### Remaining — infrastructure
-- infra/modules/api/main.tf        API Gateway HTTP + CORS + Lambda integration
-- infra/modules/observability/     CloudWatch alarms + dashboard + SNS email alerts
+- infra/modules/api: API Gateway HTTP + CORS + Lambda integration + access logs
+- infra/modules/observability: CloudWatch alarms + dashboard + SNS email alerts
+  - 4 alarms: error rate, p95 latency (extended_statistic), guardrail blocks, lambda errors
+- Frontend Vite proxy: LOCAL_API_URL (Node-only) proxies /chat to backend
+- Unit tests: 35 tests covering all business logic modules, run in 0.001s
+- End-to-end verified locally: frontend → server_local.py → ChromaDB → Bedrock → citations
 
 ### Remaining — prod deployment
-- make apply → recreate prod infra on real AWS
+- make apply → create prod infra on real AWS
 - npm run dev + npm run chunk → pipeline against real S3
 - start_ingestion_job → index chunks into Bedrock KB
 - Connect frontend: set VITE_API_BASE_URL to API Gateway URL
