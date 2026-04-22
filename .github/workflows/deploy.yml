@@ -61,7 +61,14 @@ jobs:
       # read; the terraform_data step then rm -rf's and rebuilds it with
       # the real layer contents.
       - name: Pre-create empty Lambda layer skeleton
-        run: mkdir -p infra/modules/compute/.layer-build/python
+        # `archive_file` refuses to produce an empty zip ("archive has not
+        # been created as it would be empty"), so drop a 1-byte placeholder.
+        # The terraform_data resource rm -rf's the whole directory before it
+        # installs the real deps, so the placeholder never makes it into the
+        # real Lambda layer zip.
+        run: |
+          mkdir -p infra/modules/compute/.layer-build/python
+          : > infra/modules/compute/.layer-build/python/.keep
 
       - name: Terraform init
         working-directory: infra
