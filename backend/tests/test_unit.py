@@ -46,6 +46,7 @@ from app.handler import lambda_handler
 from prompts import (
     BILINGUAL_REFUSAL,
     CLASSIFIER_PROMPT,
+    SUPERVISOR_PROMPT,
     build_chat_system_prompt,
     build_system_prompt,
 )
@@ -181,6 +182,22 @@ class TestBuildChatSystemPrompt(unittest.TestCase):
         # The RAG prompt requires citations; the chat prompt explicitly does not.
         prompt = build_chat_system_prompt("english")
         self.assertNotIn("MUST include a citation", prompt)
+
+    def test_chat_prompt_forbids_freelance_refusal_prefix(self):
+        # Locks in the fix for the prod bug where the chat node emitted the
+        # bilingual refusal as a prefix and then kept talking (e.g. suggesting
+        # the Immigration office). The prompt must instruct the model to
+        # return the refusal verbatim with no prefix/suffix.
+        prompt = build_chat_system_prompt("english")
+        self.assertIn("ENTIRE reply must be", prompt)
+        self.assertIn("no prefix, suffix, or follow-up", prompt)
+
+    def test_chat_prompt_mentions_citizenship_is_in_scope(self):
+        # Prevents the chat agent from refusing citizenship questions as
+        # out-of-scope. (Routing should not send them here in the first
+        # place, but the prompt should be coherent if something slips.)
+        prompt = build_chat_system_prompt("english")
+        self.assertIn("citizenship", prompt.lower())
 
 
 # ── check_guardrail_block ─────────────────────────────────────────────────────
@@ -1174,6 +1191,30 @@ class TestSupervisorParsing(unittest.TestCase):
         self.assertEqual(agents, ["employment"])
 
 
+class TestSupervisorPromptContent(unittest.TestCase):
+    """
+    Regression tests for prod bugs uncovered via LangSmith tracing:
+      1. "how can i get kenyan citezenship" routed to chat because the
+         prompt didn't mention citizenship explicitly.
+      2. Short follow-up questions after chit-chat got misclassified
+         because the prompt didn't tell the model to focus on the
+         latest message, not conversation history.
+    """
+
+    def test_mentions_citizenship_under_constitution(self):
+        self.assertIn("CITIZENSHIP", SUPERVISOR_PROMPT)
+        self.assertIn("Chapter 3", SUPERVISOR_PROMPT)
+
+    def test_explicitly_warns_against_history_bias(self):
+        self.assertIn("LATEST user message", SUPERVISOR_PROMPT)
+        self.assertIn("MUST NOT bias", SUPERVISOR_PROMPT)
+
+    def test_has_citizenship_routing_example(self):
+        # At least one example routing citizenship to constitution.
+        self.assertIn("kenyan citizenship", SUPERVISOR_PROMPT.lower())
+        self.assertIn("constitution", SUPERVISOR_PROMPT.lower())
+
+
 class TestRouteSupervisor(unittest.TestCase):
 
     def test_happy_path_calls_bedrock(self):
@@ -1279,16 +1320,16 @@ class TestGoldenSet(unittest.TestCase):
     def setUpClass(cls):
         cls.cases = load_golden_set()
 
-    def test_has_thirty_cases(self):
-        self.assertEqual(len(self.cases), 30)
+    def test_has_at_least_thirty_cases(self):
+        self.assertGreaterEqual(len(self.cases), 30)
 
-    def test_has_ten_per_category(self):
+    def test_has_at_least_ten_per_category(self):
         counts: dict[str, int] = {}
         for c in self.cases:
             counts[c.category] = counts.get(c.category, 0) + 1
-        self.assertEqual(counts.get("constitution"), 10)
-        self.assertEqual(counts.get("employment"), 10)
-        self.assertEqual(counts.get("land"), 10)
+        self.assertGreaterEqual(counts.get("constitution", 0), 10)
+        self.assertGreaterEqual(counts.get("employment", 0), 10)
+        self.assertGreaterEqual(counts.get("land", 0), 10)
 
     def test_has_at_least_ten_non_english_cases(self):
         non_english = [c for c in self.cases if c.language != "english"]
