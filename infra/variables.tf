@@ -49,3 +49,28 @@ variable "chroma_port" {
   type        = string
   default     = "8000"
 }
+
+# ── LangSmith observability ──────────────────────────────────────────────────
+# The API key is stored in SSM Parameter Store (SecureString) so it stays out
+# of Terraform state once applied. Provide it via `TF_VAR_langsmith_api_key`
+# in CI, or a gitignored terraform.tfvars.local during manual applies.
+# Leave empty to disable tracing entirely — the Lambda code no-ops gracefully.
+
+variable "langsmith_api_key" {
+  description = "LangSmith API key. Empty string disables tracing."
+  type        = string
+  sensitive   = true
+  default     = ""
+}
+
+variable "langsmith_project" {
+  description = "LangSmith project name that traces are filed under."
+  type        = string
+  default     = "haki-ai"
+}
+
+variable "langsmith_endpoint" {
+  description = "LangSmith API endpoint (US region by default)."
+  type        = string
+  default     = "https://api.smith.langchain.com"
+}

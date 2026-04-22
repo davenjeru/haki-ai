@@ -19,54 +19,78 @@ resource "aws_iam_role_policy" "lambda_policy" {
 
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [
-      # CloudWatch Logs — required for Lambda to write logs
-      {
-        Effect = "Allow"
-        Action = [
-          "logs:CreateLogGroup",
-          "logs:CreateLogStream",
-          "logs:PutLogEvents",
-        ]
-        Resource = "arn:aws:logs:*:*:*"
-      },
-      # Comprehend — language detection (resource-level ARNs not supported)
-      {
+    # SSM + KMS statements are appended via `for` comprehensions so the
+    # conditional yields a zero- or one-element list with a single concrete
+    # object type (rather than [] vs [obj], which fails type inference).
+    Statement = concat(
+      [
+        # CloudWatch Logs — required for Lambda to write logs
+        {
+          Effect = "Allow"
+          Action = [
+            "logs:CreateLogGroup",
+            "logs:CreateLogStream",
+            "logs:PutLogEvents",
+          ]
+          Resource = "arn:aws:logs:*:*:*"
+        },
+        # Comprehend — language detection (resource-level ARNs not supported)
+        {
+          Effect   = "Allow"
+          Action   = ["comprehend:DetectDominantLanguage"]
+          Resource = "*"
+        },
+        # CloudWatch — custom metrics for the HakiAI namespace
+        {
+          Effect   = "Allow"
+          Action   = ["cloudwatch:PutMetricData"]
+          Resource = "*"
+        },
+        # Bedrock — RAG via Knowledge Base (steps 3–5; stubs until handler is complete)
+        {
+          Effect = "Allow"
+          Action = [
+            "bedrock:RetrieveAndGenerate",
+            "bedrock:Retrieve",
+            "bedrock:InvokeModel",
+            "bedrock:ApplyGuardrail",
+          ]
+          Resource = "*"
+        },
+        # DynamoDB — LangGraph checkpoint store (conversation memory).
+        # Scoped strictly to the checkpoints table so the Lambda cannot
+        # touch anything else in DynamoDB.
+        {
+          Effect = "Allow"
+          Action = [
+            "dynamodb:GetItem",
+            "dynamodb:PutItem",
+            "dynamodb:Query",
+            "dynamodb:BatchWriteItem",
+          ]
+          Resource = var.checkpoints_table_arn
+        },
+      ],
+      # SSM — LangSmith API key fetch at cold start. Scoped to the one
+      # parameter. Only present when tracing is enabled.
+      [for arn in(var.langsmith_ssm_parameter_arn == "" ? [] : [var.langsmith_ssm_parameter_arn]) : {
         Effect   = "Allow"
-        Action   = ["comprehend:DetectDominantLanguage"]
-        Resource = "*"
-      },
-      # CloudWatch — custom metrics for the HakiAI namespace
-      {
+        Action   = ["ssm:GetParameter"]
+        Resource = arn
+      }],
+      # KMS — decrypt the SecureString with the AWS-managed SSM key.
+      # ViaService condition keeps this usable only through SSM.
+      [for arn in(var.langsmith_ssm_parameter_arn == "" ? [] : [var.langsmith_ssm_parameter_arn]) : {
         Effect   = "Allow"
-        Action   = ["cloudwatch:PutMetricData"]
+        Action   = ["kms:Decrypt"]
         Resource = "*"
-      },
-      # Bedrock — RAG via Knowledge Base (steps 3–5; stubs until handler is complete)
-      {
-        Effect = "Allow"
-        Action = [
-          "bedrock:RetrieveAndGenerate",
-          "bedrock:Retrieve",
-          "bedrock:InvokeModel",
-          "bedrock:ApplyGuardrail",
-        ]
-        Resource = "*"
-      },
-      # DynamoDB — LangGraph checkpoint store (conversation memory).
-      # Scoped strictly to the checkpoints table so the Lambda cannot touch
-      # anything else in DynamoDB.
-      {
-        Effect = "Allow"
-        Action = [
-          "dynamodb:GetItem",
-          "dynamodb:PutItem",
-          "dynamodb:Query",
-          "dynamodb:BatchWriteItem",
-        ]
-        Resource = var.checkpoints_table_arn
-      },
-    ]
+        Condition = {
+          StringEquals = {
+            "kms:ViaService" = "ssm.${var.aws_region}.amazonaws.com"
+          }
+        }
+      }]
+    )
   })
 }
 
@@ -114,6 +138,13 @@ resource "aws_lambda_function" "handler" {
       CHROMA_HOST       = var.chroma_host
       CHROMA_PORT       = var.chroma_port
       CHECKPOINTS_TABLE = var.checkpoints_table_name
+
+      # LangSmith tracing. Flipped to "true" only when an SSM parameter is
+      # wired in; the Lambda code fetches the key at cold start from SSM.
+      LANGSMITH_TRACING               = var.langsmith_ssm_parameter_name == "" ? "false" : "true"
+      LANGSMITH_PROJECT               = var.langsmith_project
+      LANGSMITH_ENDPOINT              = var.langsmith_endpoint
+      LANGSMITH_API_KEY_SSM_PARAMETER = var.langsmith_ssm_parameter_name
     }
   }
 }

@@ -48,6 +48,7 @@ provider "aws" {
       sns            = local.localstack_url
       sts            = local.localstack_url
       dynamodb       = local.localstack_url
+      ssm            = local.localstack_url
     }
   }
 }
@@ -60,6 +61,26 @@ module "storage" {
   project_name = var.project_name
   aws_region   = var.aws_region
   is_local     = local.is_local
+}
+
+# ── LangSmith API key (SSM SecureString) ─────────────────────────────────────
+# Lives at the root so both the compute module (Lambda IAM + env var) and
+# anything else that might need it can depend on it without creating a cycle
+# through the observability module. Only created when a key is supplied —
+# an empty var.langsmith_api_key disables tracing cleanly.
+
+resource "aws_ssm_parameter" "langsmith_api_key" {
+  count = var.langsmith_api_key == "" ? 0 : 1
+
+  name        = "/${var.project_name}/langsmith/api-key"
+  description = "LangSmith API key used by the Lambda for tracing."
+  type        = "SecureString"
+  value       = var.langsmith_api_key
+}
+
+locals {
+  langsmith_ssm_parameter_name = length(aws_ssm_parameter.langsmith_api_key) > 0 ? aws_ssm_parameter.langsmith_api_key[0].name : ""
+  langsmith_ssm_parameter_arn  = length(aws_ssm_parameter.langsmith_api_key) > 0 ? aws_ssm_parameter.langsmith_api_key[0].arn : ""
 }
 
 # ── AI: Bedrock KB + Guardrails ───────────────────────────────────────────────
@@ -81,18 +102,22 @@ module "ai" {
 # ── Compute: Lambda ───────────────────────────────────────────────────────────
 
 module "compute" {
-  source                 = "./modules/compute"
-  project_name           = var.project_name
-  aws_region             = var.aws_region
-  environment            = var.environment
-  knowledge_base_id      = local.is_local ? "" : module.ai[0].knowledge_base_id
-  guardrail_id           = local.is_local ? "" : module.ai[0].guardrail_id
-  guardrail_version      = local.is_local ? "DRAFT" : module.ai[0].guardrail_version
-  bedrock_model_id       = var.bedrock_model_id
-  chroma_host            = var.chroma_host
-  chroma_port            = var.chroma_port
-  checkpoints_table_name = module.storage.checkpoints_table_name
-  checkpoints_table_arn  = module.storage.checkpoints_table_arn
+  source                       = "./modules/compute"
+  project_name                 = var.project_name
+  aws_region                   = var.aws_region
+  environment                  = var.environment
+  knowledge_base_id            = local.is_local ? "" : module.ai[0].knowledge_base_id
+  guardrail_id                 = local.is_local ? "" : module.ai[0].guardrail_id
+  guardrail_version            = local.is_local ? "DRAFT" : module.ai[0].guardrail_version
+  bedrock_model_id             = var.bedrock_model_id
+  chroma_host                  = var.chroma_host
+  chroma_port                  = var.chroma_port
+  checkpoints_table_name       = module.storage.checkpoints_table_name
+  checkpoints_table_arn        = module.storage.checkpoints_table_arn
+  langsmith_ssm_parameter_name = local.langsmith_ssm_parameter_name
+  langsmith_ssm_parameter_arn  = local.langsmith_ssm_parameter_arn
+  langsmith_project            = var.langsmith_project
+  langsmith_endpoint           = var.langsmith_endpoint
 }
 
 # ── API: API Gateway HTTP ─────────────────────────────────────────────────────

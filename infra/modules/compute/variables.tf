@@ -21,3 +21,29 @@ variable "checkpoints_table_arn" {
   description = "ARN of the DynamoDB checkpoints table (used for scoping IAM)."
   type        = string
 }
+
+# ── LangSmith tracing ────────────────────────────────────────────────────────
+
+variable "langsmith_ssm_parameter_name" {
+  description = "Name of the SSM SecureString holding the LangSmith API key. Empty disables tracing."
+  type        = string
+  default     = ""
+}
+
+variable "langsmith_ssm_parameter_arn" {
+  description = "ARN of the SSM SecureString. Used to scope Lambda IAM. Empty disables tracing."
+  type        = string
+  default     = ""
+}
+
+variable "langsmith_project" {
+  description = "LangSmith project name. Only used when tracing is enabled."
+  type        = string
+  default     = "haki-ai"
+}
+
+variable "langsmith_endpoint" {
+  description = "LangSmith API endpoint. Only used when tracing is enabled."
+  type        = string
+  default     = "https://api.smith.langchain.com"
+}
