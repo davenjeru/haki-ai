@@ -114,6 +114,7 @@ module "compute" {
   chroma_port                  = var.chroma_port
   checkpoints_table_name       = module.storage.checkpoints_table_name
   checkpoints_table_arn        = module.storage.checkpoints_table_arn
+  data_bucket_arn              = module.storage.data_bucket_arn
   langsmith_ssm_parameter_name = local.langsmith_ssm_parameter_name
   langsmith_ssm_parameter_arn  = local.langsmith_ssm_parameter_arn
   langsmith_project            = var.langsmith_project

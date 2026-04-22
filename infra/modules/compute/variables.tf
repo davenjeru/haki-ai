@@ -22,6 +22,11 @@ variable "checkpoints_table_arn" {
   type        = string
 }
 
+variable "data_bucket_arn" {
+  description = "ARN of the S3 data bucket. Lambda needs GetObject on page-images/* so presigned citation URLs resolve."
+  type        = string
+}
+
 # ── LangSmith tracing ────────────────────────────────────────────────────────
 
 variable "langsmith_ssm_parameter_name" {
