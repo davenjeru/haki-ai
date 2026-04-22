@@ -172,8 +172,9 @@ module "web" {
 module "github_oidc" {
   count = local.is_local ? 0 : 1
 
-  source           = "./modules/github_oidc"
-  project_name     = var.project_name
-  repository       = var.github_repository
-  allowed_branches = var.github_allowed_branches
+  source               = "./modules/github_oidc"
+  project_name         = var.project_name
+  repository           = var.github_repository
+  allowed_branches     = var.github_allowed_branches
+  allowed_environments = var.github_allowed_environments
 }

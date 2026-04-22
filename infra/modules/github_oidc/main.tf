@@ -34,16 +34,20 @@ data "aws_iam_policy_document" "assume" {
       values   = ["sts.amazonaws.com"]
     }
 
-    # Scope the trust to exactly `refs/heads/<branch>` in the
-    # configured repo. This blocks PR builds, forks, and other
-    # branches from assuming the deploy role.
+    # Scope the trust to the configured repo + branch(es) OR to the
+    # named GitHub Environments. Both subject forms are emitted by
+    # GitHub's OIDC provider depending on how the workflow is declared:
+    #   - `jobs.<id>.environment: production`  -> sub = "repo:<r>:environment:production"
+    #   - plain job on a branch                -> sub = "repo:<r>:ref:refs/heads/<br>"
+    # Our `deploy.yml` terraform job uses `environment: production`, so
+    # we must allow that subject in addition to the raw branch ref.
     condition {
       test     = "StringLike"
       variable = "token.actions.githubusercontent.com:sub"
-      values = [
-        for b in var.allowed_branches :
-        "repo:${var.repository}:ref:refs/heads/${b}"
-      ]
+      values = concat(
+        [for b in var.allowed_branches : "repo:${var.repository}:ref:refs/heads/${b}"],
+        [for e in var.allowed_environments : "repo:${var.repository}:environment:${e}"],
+      )
     }
   }
 }

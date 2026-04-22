@@ -92,7 +92,13 @@ variable "github_repository" {
 }
 
 variable "github_allowed_branches" {
-  description = "Branch names allowed to assume the deploy role. Keep tight to gate who can apply infra."
+  description = "Branch names allowed to assume the deploy role via plain (non-environment) jobs. Keep tight to gate who can apply infra."
   type        = list(string)
   default     = ["main"]
+}
+
+variable "github_allowed_environments" {
+  description = "GitHub Environment names allowed to assume the deploy role. Our `deploy.yml` terraform job declares `environment: production`, which makes the OIDC token's `sub` claim `environment:production` rather than `ref:refs/heads/main` — so the `production` environment must be listed here."
+  type        = list(string)
+  default     = ["production"]
 }

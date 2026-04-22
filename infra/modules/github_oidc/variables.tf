@@ -9,7 +9,13 @@ variable "repository" {
 }
 
 variable "allowed_branches" {
-  description = "List of branch names on `var.repository` that may assume this role. Keep this tight — it gates who can deploy."
+  description = "List of branch names on `var.repository` that may assume this role via a plain (non-environment) job. Keep this tight — it gates who can deploy."
   type        = list(string)
   default     = ["main"]
+}
+
+variable "allowed_environments" {
+  description = "List of GitHub Environment names on `var.repository` that may assume this role. Jobs using `jobs.<id>.environment: <name>` get OIDC tokens whose `sub` claim matches `repo:<r>:environment:<name>` — those MUST be listed here for the workflow to assume the role."
+  type        = list(string)
+  default     = ["production"]
 }
