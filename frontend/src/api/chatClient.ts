@@ -3,6 +3,61 @@ import type { ChatResponse, Citation, DetectedLanguage } from '../types/chat'
 const BLOCKED_COPY =
   'Mimi ni msaidizi wa kisheria wa Kenya tu.\n\nI can only help with Kenyan legal matters.'
 
+// ── Session management ───────────────────────────────────────────────────────
+// The backend uses this id as the LangGraph thread_id for conversation memory.
+// Persisted in localStorage so a hard refresh keeps the same chat thread;
+// falls back to in-memory when localStorage is unavailable (private mode, SSR).
+
+const SESSION_STORAGE_KEY = 'haki.sessionId'
+
+function generateSessionId(): string {
+  if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) {
+    return crypto.randomUUID()
+  }
+  return `${Date.now()}-${Math.random().toString(16).slice(2)}`
+}
+
+function readStoredSessionId(): string | null {
+  try {
+    return typeof localStorage !== 'undefined'
+      ? localStorage.getItem(SESSION_STORAGE_KEY)
+      : null
+  } catch {
+    return null
+  }
+}
+
+function writeStoredSessionId(id: string): void {
+  try {
+    if (typeof localStorage !== 'undefined') {
+      localStorage.setItem(SESSION_STORAGE_KEY, id)
+    }
+  } catch {
+    // localStorage unavailable — we still keep the value in module memory.
+  }
+}
+
+let currentSessionId: string = readStoredSessionId() ?? (() => {
+  const fresh = generateSessionId()
+  writeStoredSessionId(fresh)
+  return fresh
+})()
+
+/** Returns the current chat session id (thread_id). */
+export function getSessionId(): string {
+  return currentSessionId
+}
+
+/**
+ * Mints a fresh session id, persisting it to localStorage. Call this from a
+ * future "New chat" button to start a new memory thread on the server.
+ */
+export function resetChatSession(): string {
+  currentSessionId = generateSessionId()
+  writeStoredSessionId(currentSessionId)
+  return currentSessionId
+}
+
 function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null
 }
@@ -36,6 +91,16 @@ export function parseChatResponse(json: unknown): ChatResponse {
   const blocked = json.blocked === true
   if (typeof response !== 'string') {
     throw new Error('Invalid response: missing string "response"')
+  }
+  // Defense in depth: if the server returns a different sessionId (e.g.
+  // because we sent an empty one), sync our local copy so subsequent
+  // requests stay on the same thread_id.
+  if (typeof json.sessionId === 'string' && json.sessionId.trim()) {
+    const serverSid = json.sessionId.trim()
+    if (serverSid !== currentSessionId) {
+      currentSessionId = serverSid
+      writeStoredSessionId(serverSid)
+    }
   }
   const rawCitations = json.citations
   const citations: Citation[] = Array.isArray(rawCitations)
@@ -121,7 +186,7 @@ export async function sendChatMessage(message: string): Promise<ChatResponse> {
   const res = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ message: trimmed }),
+    body: JSON.stringify({ message: trimmed, sessionId: currentSessionId }),
   })
 
   const text = await res.text()
