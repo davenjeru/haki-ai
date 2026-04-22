@@ -6,6 +6,7 @@ should call boto3.client() directly — add a make_X() function here instead.
 """
 
 import boto3
+from botocore.config import Config as BotoConfig
 from config import Config
 
 
@@ -56,3 +57,23 @@ def make_cloudwatch(config: Config):
     if config.is_local:
         return boto3.client("cloudwatch", **_localstack_kwargs(config))
     return boto3.client("cloudwatch", region_name=config.aws_region)
+
+
+def make_s3(config: Config):
+    """
+    S3 client used for generating presigned GET URLs for per-page PDFs
+    stored under page-images/ in the haki-ai data bucket.
+
+    Path-style addressing is used locally so presigned URLs point at
+    http://localhost:4566/<bucket>/<key> (browser-reachable from the host)
+    rather than the virtual-host form (<bucket>.localhost:4566) which does
+    not resolve via DNS. signature_version=s3v4 is required for LocalStack
+    presigning to match what boto3 signs.
+    """
+    boto_cfg = BotoConfig(
+        s3={"addressing_style": "path"},
+        signature_version="s3v4",
+    )
+    if config.is_local:
+        return boto3.client("s3", config=boto_cfg, **_localstack_kwargs(config))
+    return boto3.client("s3", region_name=config.aws_region, config=boto_cfg)

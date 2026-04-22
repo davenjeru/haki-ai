@@ -11,3 +11,9 @@ variable "is_local" {
   type        = bool
   default     = false
 }
+
+variable "cors_allowed_origins" {
+  description = "Origins allowed to GET page-image PDFs from the data bucket (browser CORS)."
+  type        = list(string)
+  default     = ["*"]
+}

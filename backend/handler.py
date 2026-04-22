@@ -18,7 +18,7 @@ import json
 import os
 
 from config import load_config
-from clients import make_comprehend, make_bedrock_agent_runtime, make_bedrock_runtime, make_cloudwatch
+from clients import make_comprehend, make_bedrock_agent_runtime, make_bedrock_runtime, make_cloudwatch, make_s3
 from adapters import ComprehendAdapter, LocalRAGAdapter, BedrockRAGAdapter
 from prompts import build_system_prompt
 from rag import retrieve_and_generate, check_guardrail_block, blocked_response
@@ -141,7 +141,8 @@ def lambda_handler(event, context):
             })
 
         # Step 5: Extract citations
-        citations = extract_citations(rag_result)
+        s3 = make_s3(config)
+        citations = extract_citations(rag_result, s3_client=s3, bucket=config.s3_bucket)
         response_text = rag_result.get("output", {}).get("text", "")
 
         # Step 6: Emit metrics

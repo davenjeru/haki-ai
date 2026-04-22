@@ -28,6 +28,26 @@ resource "aws_s3_bucket_public_access_block" "data" {
   restrict_public_buckets = true
 }
 
+# ── CORS ──────────────────────────────────────────────────────────────────────
+# The frontend fetches single-page PDFs from page-images/ via presigned S3 GET
+# URLs and renders them through PDF.js on a <canvas>. Those fetches are
+# cross-origin (browser ↔ S3 / LocalStack) so the bucket must allow GET from
+# the frontend origin. Allowed origins come from var.cors_allowed_origins.
+# Presigned URLs already require a valid signature, so a wildcard origin on
+# GET is safe; we still keep the list configurable so prod can be tightened.
+
+resource "aws_s3_bucket_cors_configuration" "data" {
+  bucket = aws_s3_bucket.data.id
+
+  cors_rule {
+    allowed_methods = ["GET", "HEAD"]
+    allowed_origins = var.cors_allowed_origins
+    allowed_headers = ["*"]
+    expose_headers  = ["ETag", "Content-Length", "Content-Type"]
+    max_age_seconds = 3000
+  }
+}
+
 # ── S3 Vectors bucket + index (vector store backend for Bedrock KB) ───────────
 # Not supported by LocalStack — skipped when is_local = true.
 

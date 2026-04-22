@@ -178,15 +178,51 @@ class TestExtractCitations(unittest.TestCase):
         self.assertEqual(result[0]["chunkId"], "chunk-1")
         self.assertEqual(result[1]["chunkId"], "chunk-2")
 
-    def test_page_image_key_included_when_present(self):
-        result = extract_citations(self._rag_result([self._ref("chunk-1")]))
-        self.assertIn("pageImageKey", result[0])
+    def test_page_image_url_included_when_key_and_s3_client_present(self):
+        class _FakeS3:
+            def generate_presigned_url(self, op, Params, ExpiresIn):
+                assert op == "get_object"
+                return f"https://example.test/{Params['Bucket']}/{Params['Key']}?sig=x"
 
-    def test_page_image_key_absent_when_missing(self):
+        result = extract_citations(
+            self._rag_result([self._ref("chunk-1")]),
+            s3_client=_FakeS3(),
+            bucket="haki-ai-data",
+        )
+        self.assertIn("pageImageUrl", result[0])
+        self.assertIn("page-45.pdf", result[0]["pageImageUrl"])
+
+    def test_page_image_url_absent_when_no_s3_client(self):
+        # Default invocation (no s3_client) — unit tests stay hermetic.
+        result = extract_citations(self._rag_result([self._ref("chunk-1")]))
+        self.assertNotIn("pageImageUrl", result[0])
+
+    def test_page_image_url_absent_when_key_missing(self):
+        class _FakeS3:
+            def generate_presigned_url(self, **_kwargs):
+                raise AssertionError("should not be called when key is missing")
+
         ref = self._ref("chunk-1")
         del ref["metadata"]["pageImageKey"]
-        result = extract_citations(self._rag_result([ref]))
-        self.assertNotIn("pageImageKey", result[0])
+        result = extract_citations(
+            self._rag_result([ref]),
+            s3_client=_FakeS3(),
+            bucket="haki-ai-data",
+        )
+        self.assertNotIn("pageImageUrl", result[0])
+
+    def test_page_image_url_rejects_keys_outside_page_images_prefix(self):
+        class _FakeS3:
+            def generate_presigned_url(self, **_kwargs):
+                raise AssertionError("should not sign keys outside page-images/")
+
+        ref = self._ref("chunk-1", pageImageKey="processed-chunks/evil.pdf")
+        result = extract_citations(
+            self._rag_result([ref]),
+            s3_client=_FakeS3(),
+            bucket="haki-ai-data",
+        )
+        self.assertNotIn("pageImageUrl", result[0])
 
     def test_empty_citations_returns_empty_list(self):
         result = extract_citations({"output": {"text": ""}, "citations": [], "stopReason": "end_turn"})

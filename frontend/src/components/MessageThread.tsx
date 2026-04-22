@@ -5,6 +5,12 @@ import { LanguageBadge } from './LanguageBadge'
 
 interface Props {
   messages: ChatMessage[]
+  /** Id of the message whose citation is currently shown in the source panel. */
+  activeMessageId?: string
+  /** Index of the active citation within the active message. */
+  activeCitationIndex?: number
+  /** Called when the user clicks a citation in any assistant message. */
+  onSelectCitation: (messageId: string, index: number) => void
 }
 
 function bubbleClasses(role: 'user' | 'assistant', blocked?: boolean, error?: boolean): string {
@@ -21,28 +27,37 @@ function bubbleClasses(role: 'user' | 'assistant', blocked?: boolean, error?: bo
   return `${base} border-border bg-elevated self-stretch`
 }
 
-export function MessageThread({ messages }: Props) {
+export function MessageThread({
+  messages,
+  activeMessageId,
+  activeCitationIndex,
+  onSelectCitation,
+}: Props) {
   return (
     <div className="flex flex-col gap-4" role="log" aria-live="polite" aria-relevant="additions">
       {messages.map((m) => (
         <article key={m.id} className={bubbleClasses(m.role, m.blocked, !!m.error)}>
-          <div className="min-h-[1.5rem] mb-[0.35rem]">
-            {m.role === 'assistant' && m.language && !m.error && (
+          {m.role === 'assistant' && m.language && !m.error && (
+            <div className="mb-[0.35rem]">
               <LanguageBadge language={m.language} />
-            )}
-          </div>
+            </div>
+          )}
           <div className="text-[0.98rem]">
             {m.error ? (
               <p className="m-0 text-error-text text-[0.95rem]">{m.error}</p>
             ) : (
               <>
-                <div className="whitespace-pre-wrap break-words">
-                  {m.role === 'assistant'
-                    ? renderAssistantText(m.content)
-                    : m.content}
-                </div>
+                {m.role === 'assistant' ? (
+                  <div className="break-words">{renderAssistantText(m.content)}</div>
+                ) : (
+                  <div className="whitespace-pre-wrap break-words">{m.content}</div>
+                )}
                 {m.role === 'assistant' && m.citations && m.citations.length > 0 && (
-                  <CitationBlock citations={m.citations} />
+                  <CitationBlock
+                    citations={m.citations}
+                    activeIndex={m.id === activeMessageId ? activeCitationIndex : undefined}
+                    onSelect={(index) => onSelectCitation(m.id, index)}
+                  />
                 )}
               </>
             )}
