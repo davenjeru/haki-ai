@@ -5,7 +5,15 @@ description = "Add your description here"
 requires-python = ">=3.12"
 dependencies = [
     "boto3>=1.42.91",
-    "chromadb>=1.5.8",
     "langgraph>=0.2.50",
     "langsmith>=0.1.0",
+]
+
+# Local-only deps — chromadb pulls ~50MB of native wheels (hnswlib, onnx)
+# that we never need in the Lambda. Kept out of the top-level deps so
+# `uv export --frozen` (used by the Lambda layer build) doesn't ship them.
+# Installed locally via `uv sync --group local`.
+[dependency-groups]
+local = [
+    "chromadb>=1.5.8",
 ]

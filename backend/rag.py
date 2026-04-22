@@ -49,11 +49,15 @@ def check_guardrail_block(rag_result: dict) -> bool:
     """
     Returns True if Bedrock Guardrails blocked the response.
 
-    Bedrock sets stopReason to "guardrail_intervened" when a guardrail
-    triggers. LocalRAGAdapter never sets this (it has no guardrail layer),
-    so this always returns False locally — the system prompt is the only
-    safety layer in local testing.
+    The signal differs by API:
+      - retrieve_and_generate (Bedrock KB) returns `guardrailAction: "INTERVENED"`.
+      - invoke_model with a guardrail set returns `stopReason: "guardrail_intervened"`.
+    LocalRAGAdapter never sets either (it has no guardrail layer), so this
+    always returns False locally — the system prompt is the only safety
+    layer in local testing.
     """
+    if rag_result.get("guardrailAction") == "INTERVENED":
+        return True
     return rag_result.get("stopReason") == "guardrail_intervened"
 
 

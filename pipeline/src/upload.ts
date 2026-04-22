@@ -75,19 +75,29 @@ export async function uploadChunks(
       Body: chunk.text,
       ContentType: "text/plain; charset=utf-8",
     }));
+    // Bedrock KB rejects empty-string metadata values — it fails the whole
+    // chunk with "attribute values are acceptable data types (strings,
+    // numbers, Booleans, or String Lists)". Preamble chunks legitimately
+    // have an empty `title`, so we omit any key whose value is missing
+    // or empty. All fields are treated as optional at the sidecar level;
+    // citation rendering already handles absent fields gracefully.
+    const metadataAttributes: Record<string, string> = {};
+    const maybePut = (key: string, value: string | null | undefined) => {
+      if (typeof value === "string" && value.trim() !== "") {
+        metadataAttributes[key] = value;
+      }
+    };
+    maybePut("source", chunk.source);
+    maybePut("chapter", chunk.chapter);
+    maybePut("section", chunk.section);
+    maybePut("title", chunk.title);
+    maybePut("chunkId", chunk.chunkId);
+    maybePut("pageImageKey", chunk.pageImageKey);
+
     await s3.send(new PutObjectCommand({
       Bucket: S3_BUCKET,
       Key: `${key}.metadata.json`,
-      Body: JSON.stringify({
-        metadataAttributes: {
-          source: chunk.source,
-          chapter: chunk.chapter,
-          section: chunk.section,
-          title: chunk.title,
-          chunkId: chunk.chunkId,
-          ...(chunk.pageImageKey ? { pageImageKey: chunk.pageImageKey } : {}),
-        },
-      }, null, 2),
+      Body: JSON.stringify({ metadataAttributes }, null, 2),
       ContentType: "application/json",
     }));
     await onChunkUploaded?.(chunk.chunkId);

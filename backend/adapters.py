@@ -312,15 +312,20 @@ class BedrockRAGAdapter:
           { "output": { "text" }, "citations": [...], "stopReason": str,
             "sessionId": str }
         """
+        # Bedrock accepts either a foundation-model ARN or an inference-profile
+        # ID as modelArn. Claude 4.x only supports inference profiles so we
+        # pass the ID (e.g. "us.anthropic.claude-haiku-4-5-...") directly.
         kwargs: dict = {
             "input": {"text": query},
             "retrieveAndGenerateConfiguration": {
                 "type": "KNOWLEDGE_BASE",
                 "knowledgeBaseConfiguration": {
                     "knowledgeBaseId": self._config.knowledge_base_id,
-                    "modelArn": f"arn:aws:bedrock:{self._config.aws_region}::foundation-model/{model_id}",
+                    "modelArn": model_id,
                     "generationConfiguration": {
-                        "promptTemplate": {"textPromptTemplate": system_prompt},
+                        "promptTemplate": {
+                            "textPromptTemplate": _wrap_prompt_template(system_prompt)
+                        },
                         "guardrailConfiguration": {
                             "guardrailId": self._config.guardrail_id,
                             "guardrailVersion": self._config.guardrail_version,
@@ -332,3 +337,23 @@ class BedrockRAGAdapter:
         if kb_session_id:
             kwargs["sessionId"] = kb_session_id
         return self._client.retrieve_and_generate(**kwargs)
+
+
+def _wrap_prompt_template(system_prompt: str) -> str:
+    """
+    Bedrock KB requires the textPromptTemplate to contain the
+    ``$search_results$`` placeholder so retrieved chunks can be injected,
+    and ``$output_format_instructions$`` is recommended so citation markers
+    stay parseable. Our `build_system_prompt` is a plain system message, so
+    we append the retrieval + query sections here rather than baking them
+    into prompts.py (which would break the LocalRAGAdapter path where we
+    build context ourselves).
+    """
+    return (
+        f"{system_prompt}\n\n"
+        "Search results to ground your answer (use only these; cite by source):\n"
+        "$search_results$\n\n"
+        "$output_format_instructions$"
+    )
+
+
