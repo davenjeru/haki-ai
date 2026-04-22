@@ -16,8 +16,16 @@ import uuid
 
 from clients import make_cloudwatch
 from config import load_config
-from graph import get_compiled_graph, load_history
-from metrics import elapsed_ms, emit_metrics, now_ms
+
+# NOTE: observability MUST be imported and bootstrapped before `graph` so
+# LANGSMITH_API_KEY lands in the environment before LangChain initialises
+# its tracer. Importing graph triggers the langchain import chain.
+from observability import bootstrap_langsmith, run_traced_turn
+
+bootstrap_langsmith(load_config())
+
+from graph import get_compiled_graph, load_history  # noqa: E402
+from metrics import elapsed_ms, emit_metrics, now_ms  # noqa: E402
 
 
 def lambda_handler(event, context):
@@ -49,9 +57,13 @@ def _handle_chat(event):
         session_id = (body.get("sessionId") or "").strip() or str(uuid.uuid4())
 
         graph = get_compiled_graph(config)
-        final_state = graph.invoke(
+        final_state = run_traced_turn(
+            graph,
             {"messages": [{"role": "user", "content": user_message}]},
-            config={"configurable": {"thread_id": session_id}},
+            {"configurable": {"thread_id": session_id}},
+            session_id=session_id,
+            env=config.environment,
+            message_length=len(user_message),
         )
 
         language = final_state.get("language", "english")

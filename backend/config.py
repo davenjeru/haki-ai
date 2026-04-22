@@ -23,6 +23,8 @@ class Config:
     chroma_port: int
     s3_bucket: str
     checkpoints_table: str
+    environment: str
+    langsmith_ssm_parameter: str
 
 
 def load_config() -> Config:
@@ -37,7 +39,8 @@ def load_config() -> Config:
     server running on the host machine. In Lambda, use host.docker.internal
     so the container can reach the host. Empty string = no ChromaDB (prod).
     """
-    is_local = os.environ.get("ENV") == "local"
+    env = os.environ.get("ENV", "prod")
+    is_local = env == "local"
     host = os.environ.get("LOCALSTACK_HOSTNAME", "localhost")
     port = os.environ.get("EDGE_PORT", "4566")
 
@@ -56,4 +59,6 @@ def load_config() -> Config:
         chroma_port=int(os.environ.get("CHROMA_PORT", "8000")),
         s3_bucket=os.environ.get("S3_BUCKET", "haki-ai-data"),
         checkpoints_table=os.environ.get("CHECKPOINTS_TABLE", "haki-ai-checkpoints"),
+        environment=env,
+        langsmith_ssm_parameter=os.environ.get("LANGSMITH_API_KEY_SSM_PARAMETER", ""),
     )

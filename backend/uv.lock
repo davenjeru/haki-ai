@@ -55,6 +55,7 @@ dependencies = [
     { name = "boto3" },
     { name = "chromadb" },
     { name = "langgraph" },
+    { name = "langsmith" },
 ]
 
 [package.metadata]
@@ -62,6 +63,7 @@ requires-dist = [
     { name = "boto3", specifier = ">=1.42.91" },
     { name = "chromadb", specifier = ">=1.5.8" },
     { name = "langgraph", specifier = ">=0.2.50" },
+    { name = "langsmith", specifier = ">=0.1.0" },
 ]
 
 [[package]]

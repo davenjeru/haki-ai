@@ -23,6 +23,8 @@ from checkpointer import DynamoDBSaver
 from citations import extract_citations, refresh_presigned_urls
 from classifier import classify_intent, _parse_needs_rag
 from graph import _detect_language
+import observability as obs
+from observability import _trace_metadata, bootstrap_langsmith
 from handler import lambda_handler
 from prompts import (
     BILINGUAL_REFUSAL,
@@ -580,6 +582,113 @@ class TestGraphRouting(unittest.TestCase):
         self.assertEqual(final["branch"], "chat")
 
 
+# ── observability.bootstrap_langsmith ─────────────────────────────────────────
+
+class _FakeConfig:
+    def __init__(self, *, is_local=False, region="us-east-1", endpoint="", param=""):
+        self.is_local = is_local
+        self.aws_region = region
+        self.localstack_endpoint = endpoint
+        self.langsmith_ssm_parameter = param
+
+
+class _FakeSSM:
+    def __init__(self, *, value: str | None = "secret-key", raise_on_get: bool = False):
+        self._value = value
+        self._raise = raise_on_get
+        self.calls: list[dict] = []
+
+    def get_parameter(self, *, Name, WithDecryption):
+        self.calls.append({"Name": Name, "WithDecryption": WithDecryption})
+        if self._raise:
+            raise RuntimeError("SSM is down")
+        if self._value is None:
+            return {"Parameter": {}}
+        return {"Parameter": {"Name": Name, "Value": self._value}}
+
+
+class TestBootstrapLangsmith(unittest.TestCase):
+    """
+    Verifies the cold-start SSM-fetch path. Each test runs with a clean
+    _BOOTSTRAPPED flag + cleared LANGSMITH_* env vars so results are
+    deterministic regardless of dev-machine state.
+    """
+
+    def setUp(self):
+        obs._BOOTSTRAPPED = False
+        for k in ("LANGSMITH_API_KEY", "LANGSMITH_TRACING", "LANGCHAIN_TRACING_V2"):
+            os.environ.pop(k, None)
+
+        # Patch make_ssm so the bootstrap never reaches real boto3/LocalStack.
+        import clients
+        self._ssm = _FakeSSM()
+        self._orig_make_ssm = clients.make_ssm
+        clients.make_ssm = lambda config: self._ssm
+
+    def tearDown(self):
+        import clients
+        clients.make_ssm = self._orig_make_ssm
+        obs._BOOTSTRAPPED = False
+        for k in ("LANGSMITH_API_KEY", "LANGSMITH_TRACING", "LANGCHAIN_TRACING_V2"):
+            os.environ.pop(k, None)
+
+    def test_noop_when_no_ssm_parameter_configured(self):
+        bootstrap_langsmith(_FakeConfig(param=""))
+        self.assertNotIn("LANGSMITH_API_KEY", os.environ)
+        self.assertEqual(self._ssm.calls, [])
+
+    def test_fetches_key_and_sets_env_when_parameter_configured(self):
+        bootstrap_langsmith(_FakeConfig(param="/haki-ai/langsmith/api-key"))
+        self.assertEqual(os.environ["LANGSMITH_API_KEY"], "secret-key")
+        self.assertEqual(self._ssm.calls[0]["Name"], "/haki-ai/langsmith/api-key")
+        self.assertTrue(self._ssm.calls[0]["WithDecryption"])
+
+    def test_disables_tracing_when_ssm_fetch_fails(self):
+        import clients
+        clients.make_ssm = lambda config: _FakeSSM(raise_on_get=True)
+        bootstrap_langsmith(_FakeConfig(param="/haki-ai/langsmith/api-key"))
+        self.assertNotIn("LANGSMITH_API_KEY", os.environ)
+        self.assertEqual(os.environ.get("LANGSMITH_TRACING"), "false")
+
+    def test_idempotent_second_call_does_not_refetch(self):
+        cfg = _FakeConfig(param="/haki-ai/langsmith/api-key")
+        bootstrap_langsmith(cfg)
+        bootstrap_langsmith(cfg)
+        self.assertEqual(len(self._ssm.calls), 1)
+
+    def test_respects_existing_env_var(self):
+        os.environ["LANGSMITH_API_KEY"] = "already-set-locally"
+        bootstrap_langsmith(_FakeConfig(param="/haki-ai/langsmith/api-key"))
+        self.assertEqual(os.environ["LANGSMITH_API_KEY"], "already-set-locally")
+        self.assertEqual(self._ssm.calls, [])
+
+
+class TestTraceMetadata(unittest.TestCase):
+    """Shape of the metadata attached to the haki_turn root span."""
+
+    def test_rag_turn_metadata(self):
+        state = {
+            "language": "english",
+            "needs_rag": True,
+            "blocked": False,
+            "citations": [{"chunkId": "a"}, {"chunkId": "b"}],
+        }
+        meta = _trace_metadata(state, session_id="s", env="local", message_length=42)
+        self.assertEqual(meta["session_id"], "s")
+        self.assertEqual(meta["env"], "local")
+        self.assertEqual(meta["language"], "english")
+        self.assertTrue(meta["needs_rag"])
+        self.assertFalse(meta["blocked"])
+        self.assertEqual(meta["citations_count"], 2)
+        self.assertEqual(meta["message_length"], 42)
+
+    def test_chat_turn_has_zero_citations(self):
+        state = {"language": "swahili", "needs_rag": False, "blocked": False}
+        meta = _trace_metadata(state, session_id="s", env="prod", message_length=5)
+        self.assertEqual(meta["citations_count"], 0)
+        self.assertFalse(meta["needs_rag"])
+
+
 # ── lambda_handler ────────────────────────────────────────────────────────────
 
 class _FakeCompiledGraph:
@@ -748,6 +857,8 @@ if __name__ == "__main__":
         TestInvokeChat,
         TestDynamoDBSaver,
         TestGraphRouting,
+        TestBootstrapLangsmith,
+        TestTraceMetadata,
         TestLambdaHandler,
     ]:
         suite.addTests(loader.loadTestsFromTestCase(cls))

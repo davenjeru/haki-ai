@@ -59,6 +59,17 @@ def make_cloudwatch(config: Config):
     return boto3.client("cloudwatch", region_name=config.aws_region)
 
 
+def make_ssm(config: Config):
+    """
+    SSM client used to fetch the LangSmith API key SecureString at Lambda
+    cold start. Routes to LocalStack when is_local=True so local dev can
+    mirror the prod path without calling real AWS.
+    """
+    if config.is_local:
+        return boto3.client("ssm", **_localstack_kwargs(config))
+    return boto3.client("ssm", region_name=config.aws_region)
+
+
 def make_dynamodb_table(config: Config, table_name: str):
     """
     DynamoDB Table resource for the LangGraph checkpoint store.

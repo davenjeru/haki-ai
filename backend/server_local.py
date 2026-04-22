@@ -33,6 +33,31 @@ import os
 import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
+
+def _load_dotenv(path: str) -> None:
+    """
+    Minimal .env loader (no dependency on python-dotenv). Reads KEY=VALUE
+    lines and populates os.environ for any keys not already set. Quiet
+    if the file is missing — we just fall back to whatever is in the
+    shell environment.
+    """
+    if not os.path.exists(path):
+        return
+    with open(path, "r", encoding="utf-8") as f:
+        for raw in f:
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = value
+
+
+# Project-root .env (where LANGSMITH_* + LOCALSTACK_AUTH_TOKEN live).
+_load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
+
 # Must be set before importing handler so load_config() picks it up
 os.environ.setdefault("ENV", "local")
 os.environ.setdefault("BEDROCK_MODEL_ID", "us.anthropic.claude-haiku-4-5-20251001-v1:0")
