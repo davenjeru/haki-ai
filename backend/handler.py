@@ -1,103 +1,31 @@
 """
 Haki AI — Lambda handler.
 
-Entry point for the chat API. Orchestrates:
-  1. Language detection (Comprehend)
-  2. System prompt construction (prompts.py)
-  3. RAG via Bedrock KB or local ChromaDB (rag.py)
-  4. Guardrail block check (rag.py)
-  5. Citation extraction (citations.py)
-  6. CloudWatch metrics (metrics.py)
-  7. Return response JSON
+Thin entry point that:
+  1. Parses the request (message, sessionId).
+  2. Invokes the compiled LangGraph with thread_id = sessionId.
+  3. Maps the final graph state back to the existing JSON response shape.
 
-Environment concerns (LocalStack endpoints, adapter selection) live in
-config.py, clients.py, and adapters.py — not here.
+All orchestration (language detection, classify_intent, rag_node, chat_node)
+now lives in graph.py. Memory is persisted via DynamoDBSaver, keyed by the
+frontend-provided sessionId.
 """
 
 import json
-import os
+import uuid
 
+from clients import make_cloudwatch
 from config import load_config
-from clients import make_comprehend, make_bedrock_agent_runtime, make_bedrock_runtime, make_cloudwatch, make_s3
-from adapters import ComprehendAdapter, LocalRAGAdapter, BedrockRAGAdapter
-from prompts import build_system_prompt
-from rag import retrieve_and_generate, check_guardrail_block, blocked_response
-from citations import extract_citations
-from metrics import emit_metrics, now_ms, elapsed_ms
+from graph import get_compiled_graph
+from metrics import elapsed_ms, emit_metrics, now_ms
 
-# Path to the local ChromaDB store — relative to this file
-_VECTORSTORE_PATH = os.path.join(os.path.dirname(__file__), ".local-vectorstore")
-
-# ── Language detection ────────────────────────────────────────────────────────
-
-# Minimum confidence for a language to be considered dominant.
-# Below this threshold, and when both English and Swahili are present,
-# the message is treated as mixed. Kenyan code-switching commonly scores
-# in the 0.6–0.85 range even for mostly-one-language text.
-_DOMINANCE_THRESHOLD = 0.85
-
-
-def detect_language(text: str, comprehend: ComprehendAdapter) -> str:
-    """
-    Returns "english", "swahili", or "mixed" for the given text.
-    Delegates all env/fallback concerns to ComprehendAdapter.
-    """
-    languages = comprehend.detect_dominant_language(text)
-    scores = {lang["LanguageCode"]: lang["Score"] for lang in languages}
-
-    top = languages[0] if languages else {}
-    top_code = top.get("LanguageCode")
-    top_score = top.get("Score", 0.0)
-
-    if top_code == "en" and top_score >= _DOMINANCE_THRESHOLD:
-        return "english"
-    if top_code == "sw" and top_score >= _DOMINANCE_THRESHOLD:
-        return "swahili"
-    if "en" in scores and "sw" in scores:
-        return "mixed"
-    if top_code == "sw":
-        return "swahili"
-    # Unknown language or no result — default to English so the user gets a response
-    return "english"
-
-
-# ── RAG adapter factory ───────────────────────────────────────────────────────
-
-def _make_rag_adapter(config, in_process: bool = False):
-    """
-    Returns the appropriate RAG adapter for the current environment:
-
-      is_local + chroma_host set  → LocalRAGAdapter (HTTP client → ChromaDB server)
-      is_local + in_process=True  → LocalRAGAdapter (in-process PersistentClient)
-      is_local=False              → BedrockRAGAdapter (real Bedrock KB)
-
-    chroma_host is injected as a Lambda env var (CHROMA_HOST) pointing at
-    host.docker.internal so the container can reach the ChromaDB HTTP server
-    running on the host machine. This mirrors the prod path where Lambda
-    calls Bedrock KB over the network to reach S3 Vectors.
-
-    in_process=True is used only by test_e2e_local.py (runs outside Docker).
-    """
-    if config.is_local:
-        bedrock_runtime = make_bedrock_runtime(config)
-        return LocalRAGAdapter(
-            bedrock_runtime,
-            config.embedding_model_id,
-            _VECTORSTORE_PATH,
-            chroma_host=config.chroma_host if not in_process else "",
-            chroma_port=config.chroma_port,
-        )
-    return BedrockRAGAdapter(make_bedrock_agent_runtime(config), config)
-
-
-# ── Lambda handler ────────────────────────────────────────────────────────────
 
 def lambda_handler(event, context):
     """
     Main Lambda entry point. Called by API Gateway HTTP API.
 
-    Expected request body: { "message": "<user question>" }
-    Response body:         { "response": str, "citations": list, "language": str, "blocked": bool }
+    Expected request body: { "message": "<user question>", "sessionId": "<uuid>" }
+    Response body:         { "response", "citations", "language", "blocked", "sessionId" }
     """
     config = load_config()
     cloudwatch = make_cloudwatch(config)
@@ -107,50 +35,27 @@ def lambda_handler(event, context):
     try:
         body = json.loads(event.get("body") or "{}")
         user_message = body.get("message", "").strip()
-
         if not user_message:
             return _response(400, {"error": "message is required"})
 
-        # Step 1: Language detection
-        comprehend = ComprehendAdapter(make_comprehend(config), config.is_local)
-        language = detect_language(user_message, comprehend)
+        session_id = (body.get("sessionId") or "").strip() or str(uuid.uuid4())
 
-        # Step 2: Build system prompt
-        system_prompt = build_system_prompt(language)
-
-        # Step 3: Retrieve and generate
-        rag_adapter = _make_rag_adapter(config)
-        rag_result = retrieve_and_generate(
-            user_message, system_prompt, config.bedrock_model_id, rag_adapter
+        graph = get_compiled_graph(config)
+        final_state = graph.invoke(
+            {"messages": [{"role": "user", "content": user_message}]},
+            config={"configurable": {"thread_id": session_id}},
         )
 
-        # Step 4: Check for guardrail block
-        if check_guardrail_block(rag_result):
-            emit_metrics(
-                cloudwatch,
-                language=language,
-                latency_ms=elapsed_ms(start),
-                blocked=True,
-                citations=[],
-            )
-            return _response(200, {
-                "response": blocked_response(language),
-                "citations": [],
-                "language": language,
-                "blocked": True,
-            })
+        language = final_state.get("language", "english")
+        blocked = bool(final_state.get("blocked", False))
+        citations = final_state.get("citations", [])
+        response_text = final_state.get("response_text", "")
 
-        # Step 5: Extract citations
-        s3 = make_s3(config)
-        citations = extract_citations(rag_result, s3_client=s3, bucket=config.s3_bucket)
-        response_text = rag_result.get("output", {}).get("text", "")
-
-        # Step 6: Emit metrics
         emit_metrics(
             cloudwatch,
             language=language,
             latency_ms=elapsed_ms(start),
-            blocked=False,
+            blocked=blocked,
             citations=citations,
         )
 
@@ -158,7 +63,8 @@ def lambda_handler(event, context):
             "response": response_text,
             "citations": citations,
             "language": language,
-            "blocked": False,
+            "blocked": blocked,
+            "sessionId": session_id,
         })
 
     except Exception as err:

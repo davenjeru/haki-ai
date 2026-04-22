@@ -22,6 +22,7 @@ class Config:
     chroma_host: str
     chroma_port: int
     s3_bucket: str
+    checkpoints_table: str
 
 
 def load_config() -> Config:
@@ -54,4 +55,5 @@ def load_config() -> Config:
         chroma_host=os.environ.get("CHROMA_HOST", ""),
         chroma_port=int(os.environ.get("CHROMA_PORT", "8000")),
         s3_bucket=os.environ.get("S3_BUCKET", "haki-ai-data"),
+        checkpoints_table=os.environ.get("CHECKPOINTS_TABLE", "haki-ai-checkpoints"),
     )

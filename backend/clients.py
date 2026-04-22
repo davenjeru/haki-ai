@@ -59,6 +59,28 @@ def make_cloudwatch(config: Config):
     return boto3.client("cloudwatch", region_name=config.aws_region)
 
 
+def make_dynamodb_table(config: Config, table_name: str):
+    """
+    DynamoDB Table resource for the LangGraph checkpoint store.
+
+    Returns a boto3 Table resource (not a client) because its higher-level
+    serialization handles binary attributes and Python types directly —
+    the checkpointer code stays concise.
+
+    Points at LocalStack when is_local=True.
+    """
+    import boto3  # re-import for clarity: resource != client
+    if config.is_local:
+        return boto3.resource(
+            "dynamodb",
+            endpoint_url=config.localstack_endpoint,
+            region_name=config.aws_region,
+            aws_access_key_id="test",
+            aws_secret_access_key="test",
+        ).Table(table_name)
+    return boto3.resource("dynamodb", region_name=config.aws_region).Table(table_name)
+
+
 def make_s3(config: Config):
     """
     S3 client used for generating presigned GET URLs for per-page PDFs

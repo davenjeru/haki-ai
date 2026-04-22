@@ -164,7 +164,11 @@ class LocalRAGAdapter:
     # ── Public interface ──────────────────────────────────────────────────────
 
     def retrieve_and_generate(
-        self, query: str, system_prompt: str, model_id: str
+        self,
+        query: str,
+        system_prompt: str,
+        model_id: str,
+        kb_session_id: str | None = None,  # noqa: ARG002 — accepted for interface parity with BedrockRAGAdapter
     ) -> dict:
         """
         Retrieve relevant chunks from ChromaDB, then generate a response via
@@ -175,6 +179,9 @@ class LocalRAGAdapter:
             "citations": [ { "retrievedReferences": [ { "content", "metadata", "location" } ] } ],
             "stopReason": str,
           }
+
+        kb_session_id is accepted (and ignored) so the call signature matches
+        BedrockRAGAdapter; the local path has no server-side session to persist.
         """
         query_vector = self._embed(query)
 
@@ -281,6 +288,11 @@ class BedrockRAGAdapter:
 
     rag.py calls retrieve_and_generate() on whichever adapter it receives —
     it never needs to know which environment it's in.
+
+    Supports Bedrock KB's native multi-turn sessions: when kb_session_id is
+    passed in, Bedrock uses it to maintain retrieval context across turns.
+    The server-generated sessionId is always echoed back in the response
+    under the "sessionId" key so the caller can thread it through state.
     """
 
     def __init__(self, client, config):
@@ -288,16 +300,21 @@ class BedrockRAGAdapter:
         self._config = config
 
     def retrieve_and_generate(
-        self, query: str, system_prompt: str, model_id: str
+        self,
+        query: str,
+        system_prompt: str,
+        model_id: str,
+        kb_session_id: str | None = None,
     ) -> dict:
         """
         Calls Bedrock KB retrieve_and_generate and returns the raw response.
         The response already matches the expected shape:
-          { "output": { "text" }, "citations": [...], "stopReason": str }
+          { "output": { "text" }, "citations": [...], "stopReason": str,
+            "sessionId": str }
         """
-        response = self._client.retrieve_and_generate(
-            input={"text": query},
-            retrieveAndGenerateConfiguration={
+        kwargs: dict = {
+            "input": {"text": query},
+            "retrieveAndGenerateConfiguration": {
                 "type": "KNOWLEDGE_BASE",
                 "knowledgeBaseConfiguration": {
                     "knowledgeBaseId": self._config.knowledge_base_id,
@@ -311,5 +328,7 @@ class BedrockRAGAdapter:
                     },
                 },
             },
-        )
-        return response
+        }
+        if kb_session_id:
+            kwargs["sessionId"] = kb_session_id
+        return self._client.retrieve_and_generate(**kwargs)

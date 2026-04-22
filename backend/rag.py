@@ -20,6 +20,7 @@ def retrieve_and_generate(
     system_prompt: str,
     model_id: str,
     rag_adapter,
+    kb_session_id: str | None = None,
 ) -> dict:
     """
     Calls the RAG adapter and returns its response dict:
@@ -27,15 +28,21 @@ def retrieve_and_generate(
         "output":    { "text": str },
         "citations": [ { "retrievedReferences": [...] } ],
         "stopReason": str,
+        "sessionId": str,   # only on Bedrock path
       }
 
     Args:
-        query:        The user's message.
+        query:         The user's message.
         system_prompt: Built by prompts.build_system_prompt(language).
-        model_id:     Bedrock model ID (e.g. "anthropic.claude-3-sonnet-...").
-        rag_adapter:  LocalRAGAdapter or BedrockRAGAdapter instance.
+        model_id:      Bedrock model ID (e.g. "anthropic.claude-3-sonnet-...").
+        rag_adapter:   LocalRAGAdapter or BedrockRAGAdapter instance.
+        kb_session_id: Bedrock KB session id from a prior turn (prod only).
+                       The adapter returns a new sessionId which callers
+                       should persist in graph state for the next turn.
     """
-    return rag_adapter.retrieve_and_generate(query, system_prompt, model_id)
+    return rag_adapter.retrieve_and_generate(
+        query, system_prompt, model_id, kb_session_id=kb_session_id
+    )
 
 
 def check_guardrail_block(rag_result: dict) -> bool:

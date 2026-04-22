@@ -27,17 +27,21 @@ in English and Swahili, with citations to specific Act, Chapter, and Section.
 haki-ai/
 ├── frontend/
 ├── backend/
-│   ├── handler.py         # Lambda entry point — thin orchestrator
+│   ├── handler.py         # Lambda entry point — thin wrapper around the LangGraph
+│   ├── graph.py           # LangGraph StateGraph: detect_language → classify_intent → {rag_node|chat_node}
+│   ├── classifier.py      # Haiku-based intent classifier (needs_rag true/false)
+│   ├── chat_node.py       # Direct invoke_model for conversational (no-RAG) turns
+│   ├── checkpointer.py    # DynamoDBSaver — persistent LangGraph memory
 │   ├── config.py          # single source of truth for env vars
-│   ├── clients.py         # boto3 factory (make_comprehend, make_bedrock, etc.)
+│   ├── clients.py         # boto3 factory (make_comprehend, make_bedrock, make_dynamodb_table, etc.)
 │   ├── adapters.py        # ComprehendAdapter + LocalRAGAdapter + BedrockRAGAdapter
-│   ├── prompts.py         # system prompt builder (step 2)
-│   ├── rag.py             # retrieve_and_generate + guardrail check (steps 3–4)
-│   ├── citations.py       # citation extraction (step 5)
-│   ├── metrics.py         # CloudWatch metric emission (step 6)
+│   ├── prompts.py         # system prompts: RAG, chat-only, and classifier
+│   ├── rag.py             # retrieve_and_generate + guardrail check + KB sessionId threading
+│   ├── citations.py       # citation extraction
+│   ├── metrics.py         # CloudWatch metric emission
 │   ├── ingest_local.py    # one-time local ingestion: S3 chunks → ChromaDB [local only]
 │   ├── server_local.py    # local HTTP server for frontend dev (port 8080) [local only]
-│   ├── test_unit.py       # 35 unit tests — no AWS required [local only]
+│   ├── test_unit.py       # 60 unit tests — no AWS required [local only]
 │   ├── test_e2e_local.py  # in-process end-to-end RAG test [local only]
 │   └── test_language_detection.py  # language detection test runner [local only]
 ├── pipeline/              # local data prep (TypeScript, LiteParse)
@@ -79,14 +83,33 @@ haki-ai/
   I can only help with Kenyan legal matters."
 - Every response must cite Act + Chapter + Section
 
-## Lambda core logic (handler.py)
-1. Detect language (Comprehend) → english / swahili / mixed
-2. Build system prompt with language instruction
-3. Call bedrock_agent_runtime.retrieve_and_generate with KB id + model
-4. Check for guardrail block (stopReason)
-5. Extract citations from response
-6. Log custom CloudWatch metrics
-7. Return { response, citations, language, blocked }
+## Lambda core logic (handler.py + graph.py)
+`handler.py` is a thin wrapper that parses { message, sessionId } and invokes
+a compiled LangGraph with `thread_id = sessionId`. All orchestration lives
+in `graph.py` as a StateGraph:
+
+```
+START → detect_language → classify_intent → [ rag_node | chat_node ] → END
+```
+
+Per-node work:
+1. `detect_language` — Comprehend → english / swahili / mixed
+2. `classify_intent` — Haiku returns `{"needs_rag": bool}` from full history
+3a. `rag_node` — Bedrock KB retrieve_and_generate (threads KB sessionId),
+    guardrail check, citation extraction
+3b. `chat_node` — direct Claude invoke_model with message history, no citations
+4. Handler emits CloudWatch metrics and returns
+   { response, citations, language, blocked, sessionId }
+
+Memory: DynamoDBSaver persists the full state (messages + kb_session_id)
+keyed by thread_id. Survives Lambda cold starts and server_local.py restarts.
+TTL on `expires_at` auto-purges abandoned sessions after 30 days.
+
+Routing examples:
+- "My name is Dave"           → chat_node (no citations)
+- "What is my name?"          → chat_node (reads history from checkpointer)
+- "What does section 40 say?" → rag_node (Bedrock KB + citations)
+- "Thanks!"                   → chat_node (no citations)
 
 ## PDF pipeline (pipeline/)
 - Runtime: TypeScript / Node.js (local scripts, not Lambda)
@@ -202,7 +225,7 @@ limitations apply, inject into lambda_handler — no changes to business logic f
 - uv manages Python dependencies (Python 3.12)
 
 ### Test scripts (all committed to git, excluded from Lambda zip)
-- `uv run test_unit.py`        — 35 unit tests, no AWS required, runs in 0.001s
+- `uv run test_unit.py`        — 60 unit tests, no AWS required, runs in 0.01s
 - `ENV=local uv run test_e2e_local.py` — in-process end-to-end RAG (real Bedrock)
 - `ENV=local uv run test_language_detection.py` — language detection against LocalStack
 

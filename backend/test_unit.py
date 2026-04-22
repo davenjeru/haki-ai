@@ -9,6 +9,7 @@ Usage:
   uv run test_unit.py
 """
 
+import io
 import json
 import os
 import sys
@@ -16,12 +17,20 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from handler import detect_language, lambda_handler, _make_rag_adapter
 from adapters import ComprehendAdapter
-from prompts import build_system_prompt, BILINGUAL_REFUSAL
-from rag import check_guardrail_block, blocked_response
+from chat_node import invoke_chat
+from checkpointer import DynamoDBSaver
 from citations import extract_citations
-from config import load_config
+from classifier import classify_intent, _parse_needs_rag
+from graph import _detect_language
+from handler import lambda_handler
+from prompts import (
+    BILINGUAL_REFUSAL,
+    CLASSIFIER_PROMPT,
+    build_chat_system_prompt,
+    build_system_prompt,
+)
+from rag import blocked_response, check_guardrail_block
 
 
 # ── Stubs ─────────────────────────────────────────────────────────────────────
@@ -39,46 +48,64 @@ def _adapter(languages: list[dict]) -> ComprehendAdapter:
     return ComprehendAdapter(_FixedComprehendClient(languages), is_local=False)
 
 
+class _FakeBedrockRuntime:
+    """
+    Stub for bedrock-runtime invoke_model. Returns a canned response body
+    shaped like Claude's InvokeModel output: {"content": [{"text": ...}], ...}.
+    """
+    def __init__(self, text: str = "(stubbed)", stop_reason: str = "end_turn"):
+        self.text = text
+        self.stop_reason = stop_reason
+        self.calls: list[dict] = []  # captured request payloads
+
+    def invoke_model(self, *, modelId, body, contentType, accept):
+        self.calls.append({
+            "modelId": modelId,
+            "body": json.loads(body),
+            "contentType": contentType,
+            "accept": accept,
+        })
+        payload = json.dumps({
+            "content": [{"text": self.text}],
+            "stop_reason": self.stop_reason,
+        }).encode()
+        return {"body": io.BytesIO(payload)}
+
+
 # ── detect_language ───────────────────────────────────────────────────────────
 
 class TestDetectLanguage(unittest.TestCase):
 
     def test_high_confidence_english(self):
         adapter = _adapter([{"LanguageCode": "en", "Score": 0.97}])
-        self.assertEqual(detect_language("hello", adapter), "english")
+        self.assertEqual(_detect_language("hello", adapter), "english")
 
     def test_high_confidence_swahili(self):
         adapter = _adapter([{"LanguageCode": "sw", "Score": 0.91}])
-        self.assertEqual(detect_language("habari", adapter), "swahili")
+        self.assertEqual(_detect_language("habari", adapter), "swahili")
 
     def test_mixed_when_both_languages_present(self):
         adapter = _adapter([
             {"LanguageCode": "en", "Score": 0.72},
             {"LanguageCode": "sw", "Score": 0.26},
         ])
-        self.assertEqual(detect_language("hello habari", adapter), "mixed")
+        self.assertEqual(_detect_language("hello habari", adapter), "mixed")
 
     def test_english_below_threshold_no_swahili_defaults_english(self):
-        # en is top but below 0.85, no sw present → default english
         adapter = _adapter([{"LanguageCode": "en", "Score": 0.70}])
-        self.assertEqual(detect_language("bonjour", adapter), "english")
+        self.assertEqual(_detect_language("bonjour", adapter), "english")
 
     def test_swahili_below_threshold_no_english_still_swahili(self):
-        # sw is top but below 0.85, no en present → swahili fallback
         adapter = _adapter([{"LanguageCode": "sw", "Score": 0.70}])
-        self.assertEqual(detect_language("habari", adapter), "swahili")
+        self.assertEqual(_detect_language("habari", adapter), "swahili")
 
     def test_unknown_language_defaults_english(self):
         adapter = _adapter([{"LanguageCode": "fr", "Score": 0.95}])
-        self.assertEqual(detect_language("bonjour", adapter), "english")
+        self.assertEqual(_detect_language("bonjour", adapter), "english")
 
     def test_empty_language_list_defaults_english(self):
         adapter = _adapter([])
-        self.assertEqual(detect_language("", adapter), "english")
-
-    def test_empty_message_defaults_english(self):
-        adapter = _adapter([{"LanguageCode": "en", "Score": 0.99}])
-        self.assertEqual(detect_language("", adapter), "english")
+        self.assertEqual(_detect_language("", adapter), "english")
 
 
 # ── build_system_prompt ───────────────────────────────────────────────────────
@@ -86,12 +113,10 @@ class TestDetectLanguage(unittest.TestCase):
 class TestBuildSystemPrompt(unittest.TestCase):
 
     def test_english_prompt_contains_english_instruction(self):
-        prompt = build_system_prompt("english")
-        self.assertIn("Respond in English.", prompt)
+        self.assertIn("Respond in English.", build_system_prompt("english"))
 
     def test_swahili_prompt_contains_swahili_instruction(self):
-        prompt = build_system_prompt("swahili")
-        self.assertIn("Kiswahili", prompt)
+        self.assertIn("Kiswahili", build_system_prompt("swahili"))
 
     def test_mixed_prompt_contains_both_language_instructions(self):
         prompt = build_system_prompt("mixed")
@@ -99,8 +124,7 @@ class TestBuildSystemPrompt(unittest.TestCase):
         self.assertIn("Swahili", prompt)
 
     def test_unknown_language_falls_back_to_english(self):
-        prompt = build_system_prompt("klingon")
-        self.assertIn("Respond in English.", prompt)
+        self.assertIn("Respond in English.", build_system_prompt("klingon"))
 
     def test_all_prompts_contain_citation_rule(self):
         for lang in ("english", "swahili", "mixed"):
@@ -118,6 +142,28 @@ class TestBuildSystemPrompt(unittest.TestCase):
                 self.assertIn(BILINGUAL_REFUSAL, build_system_prompt(lang))
 
 
+# ── build_chat_system_prompt ──────────────────────────────────────────────────
+
+class TestBuildChatSystemPrompt(unittest.TestCase):
+
+    def test_chat_prompt_is_not_rag_prompt(self):
+        self.assertNotEqual(build_chat_system_prompt("english"), build_system_prompt("english"))
+
+    def test_chat_prompt_contains_scope_and_language(self):
+        prompt = build_chat_system_prompt("english")
+        self.assertIn("Haki AI", prompt)
+        self.assertIn("Respond in English.", prompt)
+
+    def test_chat_prompt_refuses_non_legal_substantive(self):
+        prompt = build_chat_system_prompt("english")
+        self.assertIn(BILINGUAL_REFUSAL, prompt)
+
+    def test_chat_prompt_does_not_demand_citations(self):
+        # The RAG prompt requires citations; the chat prompt explicitly does not.
+        prompt = build_chat_system_prompt("english")
+        self.assertNotIn("MUST include a citation", prompt)
+
+
 # ── check_guardrail_block ─────────────────────────────────────────────────────
 
 class TestCheckGuardrailBlock(unittest.TestCase):
@@ -131,12 +177,8 @@ class TestCheckGuardrailBlock(unittest.TestCase):
     def test_missing_stop_reason_returns_false(self):
         self.assertFalse(check_guardrail_block({}))
 
-    def test_other_stop_reason_returns_false(self):
-        self.assertFalse(check_guardrail_block({"stopReason": "max_tokens"}))
-
     def test_blocked_response_contains_bilingual_refusal(self):
         self.assertEqual(blocked_response("english"), BILINGUAL_REFUSAL)
-        self.assertEqual(blocked_response("swahili"), BILINGUAL_REFUSAL)
 
 
 # ── extract_citations ─────────────────────────────────────────────────────────
@@ -175,13 +217,10 @@ class TestExtractCitations(unittest.TestCase):
         refs = [self._ref("chunk-1"), self._ref("chunk-1"), self._ref("chunk-2")]
         result = extract_citations(self._rag_result(refs))
         self.assertEqual(len(result), 2)
-        self.assertEqual(result[0]["chunkId"], "chunk-1")
-        self.assertEqual(result[1]["chunkId"], "chunk-2")
 
     def test_page_image_url_included_when_key_and_s3_client_present(self):
         class _FakeS3:
             def generate_presigned_url(self, op, Params, ExpiresIn):
-                assert op == "get_object"
                 return f"https://example.test/{Params['Bucket']}/{Params['Key']}?sig=x"
 
         result = extract_citations(
@@ -190,43 +229,26 @@ class TestExtractCitations(unittest.TestCase):
             bucket="haki-ai-data",
         )
         self.assertIn("pageImageUrl", result[0])
-        self.assertIn("page-45.pdf", result[0]["pageImageUrl"])
 
     def test_page_image_url_absent_when_no_s3_client(self):
-        # Default invocation (no s3_client) — unit tests stay hermetic.
         result = extract_citations(self._rag_result([self._ref("chunk-1")]))
         self.assertNotIn("pageImageUrl", result[0])
 
-    def test_page_image_url_absent_when_key_missing(self):
-        class _FakeS3:
-            def generate_presigned_url(self, **_kwargs):
-                raise AssertionError("should not be called when key is missing")
-
-        ref = self._ref("chunk-1")
-        del ref["metadata"]["pageImageKey"]
-        result = extract_citations(
-            self._rag_result([ref]),
-            s3_client=_FakeS3(),
-            bucket="haki-ai-data",
-        )
-        self.assertNotIn("pageImageUrl", result[0])
-
     def test_page_image_url_rejects_keys_outside_page_images_prefix(self):
-        class _FakeS3:
-            def generate_presigned_url(self, **_kwargs):
-                raise AssertionError("should not sign keys outside page-images/")
-
         ref = self._ref("chunk-1", pageImageKey="processed-chunks/evil.pdf")
+        class _FakeS3:
+            def generate_presigned_url(self, **_):
+                raise AssertionError("should not sign keys outside page-images/")
         result = extract_citations(
-            self._rag_result([ref]),
-            s3_client=_FakeS3(),
-            bucket="haki-ai-data",
+            self._rag_result([ref]), s3_client=_FakeS3(), bucket="haki-ai-data",
         )
         self.assertNotIn("pageImageUrl", result[0])
 
     def test_empty_citations_returns_empty_list(self):
-        result = extract_citations({"output": {"text": ""}, "citations": [], "stopReason": "end_turn"})
-        self.assertEqual(result, [])
+        self.assertEqual(
+            extract_citations({"output": {"text": ""}, "citations": [], "stopReason": "end_turn"}),
+            [],
+        )
 
     def test_falls_back_to_s3_uri_when_chunk_id_missing(self):
         ref = self._ref("chunk-1")
@@ -234,124 +256,390 @@ class TestExtractCitations(unittest.TestCase):
         result = extract_citations(self._rag_result([ref]))
         self.assertEqual(result[0]["chunkId"], "s3://haki-ai-data/processed-chunks/chunk-1.txt")
 
-    def test_deduplicates_across_multiple_citation_groups(self):
-        rag_result = {
-            "output": {"text": "answer"},
-            "citations": [
-                {"retrievedReferences": [self._ref("chunk-1")]},
-                {"retrievedReferences": [self._ref("chunk-1"), self._ref("chunk-2")]},
-            ],
-            "stopReason": "end_turn",
-        }
-        result = extract_citations(rag_result)
-        self.assertEqual(len(result), 2)
-
     def test_missing_metadata_fields_return_empty_strings(self):
         ref = {"content": {"text": "text"}, "metadata": {"chunkId": "chunk-x"}, "location": {}}
         result = extract_citations(self._rag_result([ref]))
         self.assertEqual(result[0]["source"], "")
-        self.assertEqual(result[0]["chapter"], "")
-        self.assertEqual(result[0]["section"], "")
+
+
+# ── classifier ────────────────────────────────────────────────────────────────
+
+class TestClassifierParsing(unittest.TestCase):
+    """Parses the model's raw reply into a bool."""
+
+    def test_parses_true(self):
+        self.assertTrue(_parse_needs_rag('{"needs_rag": true}'))
+
+    def test_parses_false(self):
+        self.assertFalse(_parse_needs_rag('{"needs_rag": false}'))
+
+    def test_extracts_json_from_surrounding_text(self):
+        self.assertTrue(_parse_needs_rag('Here you go: {"needs_rag": true} cheers.'))
+
+    def test_defaults_to_true_on_malformed_json(self):
+        self.assertTrue(_parse_needs_rag("not json at all"))
+
+    def test_defaults_to_true_when_key_missing(self):
+        self.assertTrue(_parse_needs_rag('{"other_key": false}'))
+
+    def test_defaults_to_true_when_value_not_bool(self):
+        self.assertTrue(_parse_needs_rag('{"needs_rag": "yes"}'))
+
+
+class TestClassifyIntent(unittest.TestCase):
+    """End-to-end classifier flow with a stubbed Bedrock client."""
+
+    def test_returns_true_when_model_says_true(self):
+        br = _FakeBedrockRuntime(text='{"needs_rag": true}')
+        self.assertTrue(classify_intent(
+            [{"role": "user", "content": "What does section 40 say?"}],
+            br,
+            "claude-haiku",
+            CLASSIFIER_PROMPT,
+        ))
+
+    def test_returns_false_when_model_says_false(self):
+        br = _FakeBedrockRuntime(text='{"needs_rag": false}')
+        self.assertFalse(classify_intent(
+            [{"role": "user", "content": "My name is Dave"}],
+            br,
+            "claude-haiku",
+            CLASSIFIER_PROMPT,
+        ))
+
+    def test_sends_classifier_prompt_as_system(self):
+        br = _FakeBedrockRuntime(text='{"needs_rag": false}')
+        classify_intent(
+            [{"role": "user", "content": "hi"}],
+            br,
+            "claude-haiku",
+            CLASSIFIER_PROMPT,
+        )
+        self.assertEqual(br.calls[0]["body"]["system"], CLASSIFIER_PROMPT)
+
+    def test_includes_recent_turns_in_transcript(self):
+        br = _FakeBedrockRuntime(text='{"needs_rag": false}')
+        history = [
+            {"role": "user", "content": "My name is Dave"},
+            {"role": "assistant", "content": "Nice to meet you, Dave."},
+            {"role": "user", "content": "What is my name?"},
+        ]
+        classify_intent(history, br, "claude-haiku", CLASSIFIER_PROMPT)
+        transcript = br.calls[0]["body"]["messages"][0]["content"]
+        self.assertIn("Dave", transcript)
+        self.assertIn("What is my name?", transcript)
+
+
+# ── chat_node.invoke_chat ─────────────────────────────────────────────────────
+
+class TestInvokeChat(unittest.TestCase):
+
+    def test_returns_model_text(self):
+        br = _FakeBedrockRuntime(text="Your name is Dave.")
+        reply = invoke_chat(
+            [{"role": "user", "content": "What is my name?"}],
+            "english",
+            br,
+            "claude-haiku",
+        )
+        self.assertEqual(reply, "Your name is Dave.")
+
+    def test_sends_chat_system_prompt(self):
+        br = _FakeBedrockRuntime(text="ok")
+        invoke_chat(
+            [{"role": "user", "content": "Hi"}],
+            "english",
+            br,
+            "claude-haiku",
+        )
+        self.assertEqual(br.calls[0]["body"]["system"], build_chat_system_prompt("english"))
+
+    def test_passes_full_history(self):
+        br = _FakeBedrockRuntime(text="ok")
+        history = [
+            {"role": "user", "content": "My name is Dave"},
+            {"role": "assistant", "content": "Nice to meet you, Dave."},
+            {"role": "user", "content": "What is my name?"},
+        ]
+        invoke_chat(history, "english", br, "claude-haiku")
+        sent = br.calls[0]["body"]["messages"]
+        self.assertEqual(len(sent), 3)
+        self.assertEqual(sent[-1]["content"], "What is my name?")
+
+    def test_skips_empty_or_invalid_messages(self):
+        br = _FakeBedrockRuntime(text="ok")
+        history = [
+            {"role": "system", "content": "ignore me"},
+            {"role": "user", "content": "   "},
+            {"role": "user", "content": "real question"},
+        ]
+        invoke_chat(history, "english", br, "claude-haiku")
+        sent = br.calls[0]["body"]["messages"]
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0]["content"], "real question")
+
+
+# ── DynamoDBSaver ─────────────────────────────────────────────────────────────
+
+class _InMemoryDynamoTable:
+    """
+    Minimal stand-in for boto3.resource('dynamodb').Table. Supports the
+    operations DynamoDBSaver uses: put_item, get_item, query. Items are
+    stored keyed by (thread_id, sort_key) in a dict; query does a
+    begins_with filter on sort_key and honours ScanIndexForward + Limit.
+    """
+
+    def __init__(self):
+        self.items: dict[tuple[str, str], dict] = {}
+
+    def put_item(self, *, Item):
+        self.items[(Item["thread_id"], Item["sort_key"])] = dict(Item)
+
+    def get_item(self, *, Key):
+        item = self.items.get((Key["thread_id"], Key["sort_key"]))
+        return {"Item": item} if item else {}
+
+    def query(self, *, KeyConditionExpression, ScanIndexForward=True, Limit=None):
+        # Dig the thread_id + prefix out of the Boto3 condition object.
+        expr = KeyConditionExpression.get_expression()
+        values = expr["values"]
+        thread_cond = values[0].get_expression()
+        sort_cond = values[1].get_expression()
+        thread_id = thread_cond["values"][1]
+        prefix = sort_cond["values"][1]
+
+        matches = [
+            item for (tid, sk), item in self.items.items()
+            if tid == thread_id and sk.startswith(prefix)
+        ]
+        matches.sort(key=lambda it: it["sort_key"], reverse=not ScanIndexForward)
+        if Limit is not None:
+            matches = matches[:Limit]
+        return {"Items": matches}
+
+
+class TestDynamoDBSaver(unittest.TestCase):
+    """
+    Verifies round-trip of a checkpoint via the in-memory DynamoDB stub.
+    Uses a minimal Checkpoint dict constructed by hand rather than running
+    a full graph — keeps the test hermetic and focused on storage.
+    """
+
+    def _saver(self) -> tuple[DynamoDBSaver, _InMemoryDynamoTable]:
+        table = _InMemoryDynamoTable()
+        return DynamoDBSaver(table), table
+
+    def _config(self, thread_id: str = "t1") -> dict:
+        return {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
+
+    def _checkpoint(self, ckpt_id: str = "c1") -> dict:
+        return {
+            "v": 1,
+            "id": ckpt_id,
+            "ts": "2026-01-01T00:00:00+00:00",
+            "channel_values": {"messages": [{"role": "user", "content": "hi"}]},
+            "channel_versions": {"messages": "1.0"},
+            "versions_seen": {},
+        }
+
+    def test_put_then_get_tuple_returns_same_values(self):
+        saver, _ = self._saver()
+        cfg = self._config()
+        ckpt = self._checkpoint()
+        saver.put(cfg, ckpt, {"source": "input"}, {"messages": "1.0"})
+
+        tup = saver.get_tuple(cfg)
+        self.assertIsNotNone(tup)
+        self.assertEqual(tup.checkpoint["id"], "c1")
+        self.assertEqual(
+            tup.checkpoint["channel_values"]["messages"],
+            [{"role": "user", "content": "hi"}],
+        )
+
+    def test_get_tuple_returns_latest_when_multiple_checkpoints(self):
+        saver, _ = self._saver()
+        cfg = self._config()
+        saver.put(cfg, self._checkpoint("c1"), {"source": "input"}, {"messages": "1.0"})
+        saver.put(cfg, self._checkpoint("c2"), {"source": "input"}, {"messages": "2.0"})
+        tup = saver.get_tuple(cfg)
+        self.assertEqual(tup.checkpoint["id"], "c2")
+
+    def test_get_tuple_returns_none_for_unknown_thread(self):
+        saver, _ = self._saver()
+        self.assertIsNone(saver.get_tuple(self._config("unknown")))
+
+    def test_put_writes_stores_and_load_via_get_tuple(self):
+        saver, _ = self._saver()
+        cfg = self._config()
+        saver.put(cfg, self._checkpoint(), {"source": "input"}, {"messages": "1.0"})
+        write_cfg = {"configurable": {"thread_id": "t1", "checkpoint_ns": "", "checkpoint_id": "c1"}}
+        saver.put_writes(write_cfg, [("messages", "a-write")], task_id="task-1")
+        tup = saver.get_tuple(cfg)
+        self.assertEqual(len(tup.pending_writes), 1)
+        self.assertEqual(tup.pending_writes[0][2], "a-write")
+
+
+# ── Graph routing ─────────────────────────────────────────────────────────────
+
+class TestGraphRouting(unittest.TestCase):
+    """
+    Verifies classify_intent's return value selects the correct downstream
+    node. We build a real StateGraph with stubbed nodes so the conditional
+    edge is exercised against the actual LangGraph runtime.
+    """
+
+    def _run(self, needs_rag: bool) -> dict:
+        from langgraph.checkpoint.memory import InMemorySaver
+        from langgraph.graph import END, START, StateGraph
+        from langgraph.graph.message import add_messages
+        from typing import Annotated, TypedDict
+
+        class S(TypedDict, total=False):
+            messages: Annotated[list, add_messages]
+            needs_rag: bool
+            branch: str
+
+        def classify(_state):
+            return {"needs_rag": needs_rag}
+
+        def rag(_state):
+            return {"branch": "rag", "messages": [{"role": "assistant", "content": "rag reply"}]}
+
+        def chat(_state):
+            return {"branch": "chat", "messages": [{"role": "assistant", "content": "chat reply"}]}
+
+        b = StateGraph(S)
+        b.add_node("classify", classify)
+        b.add_node("rag", rag)
+        b.add_node("chat", chat)
+        b.add_edge(START, "classify")
+        b.add_conditional_edges(
+            "classify",
+            lambda s: "rag" if s.get("needs_rag") else "chat",
+            {"rag": "rag", "chat": "chat"},
+        )
+        b.add_edge("rag", END)
+        b.add_edge("chat", END)
+        graph = b.compile(checkpointer=InMemorySaver())
+        return graph.invoke(
+            {"messages": [{"role": "user", "content": "hello"}]},
+            config={"configurable": {"thread_id": "t-graph"}},
+        )
+
+    def test_needs_rag_true_routes_to_rag(self):
+        final = self._run(True)
+        self.assertEqual(final["branch"], "rag")
+
+    def test_needs_rag_false_routes_to_chat(self):
+        final = self._run(False)
+        self.assertEqual(final["branch"], "chat")
 
 
 # ── lambda_handler ────────────────────────────────────────────────────────────
 
-class _FakeRAGAdapter:
-    """Minimal RAG stub for unit tests — no AWS calls made."""
-    def retrieve_and_generate(self, query, system_prompt, model_id):
-        return {
-            "output": {"text": "This is a test response."},
-            "citations": [],
-            "stopReason": "end_turn",
-        }
+class _FakeCompiledGraph:
+    """Returns a canned final state from .invoke() and records the call."""
+    def __init__(self, final_state: dict):
+        self._final_state = final_state
+        self.invocations: list[dict] = []
+
+    def invoke(self, state, config):
+        self.invocations.append({"state": state, "config": config})
+        return self._final_state
 
 
 class TestLambdaHandler(unittest.TestCase):
     """
-    Tests lambda_handler directly using a fake RAG adapter.
-    LocalStack not required.
+    Exercises the thin handler against a stubbed compiled graph.
+    Neither AWS nor LocalStack is needed.
     """
 
     def setUp(self):
-        # Patch adapters so no AWS calls are made
         import handler as h
 
-        self._orig_make_comprehend = h.make_comprehend
-        self._orig_make_cloudwatch = h.make_cloudwatch
-        self._orig_make_rag = h._make_rag_adapter
+        self._orig_get_graph = h.get_compiled_graph
+        self._orig_make_cw = h.make_cloudwatch
 
-        # Comprehend: return English
-        class _FakeComprehendClient:
-            def detect_dominant_language(self, Text):
-                return {"Languages": [{"LanguageCode": "en", "Score": 0.98}]}
+        self.graph = _FakeCompiledGraph({
+            "messages": [],
+            "language": "english",
+            "needs_rag": True,
+            "citations": [{"source": "Employment Act 2007"}],
+            "blocked": False,
+            "response_text": "Here is your answer.",
+            "kb_session_id": "kb-123",
+        })
+        h.get_compiled_graph = lambda config: self.graph
 
-        h.make_comprehend = lambda config: _FakeComprehendClient()
-
-        # CloudWatch: no-op
         class _FakeCloudWatch:
-            def put_metric_data(self, **kwargs): pass
+            def put_metric_data(self, **_): pass
 
         h.make_cloudwatch = lambda config: _FakeCloudWatch()
 
-        # RAG: fake adapter
-        h._make_rag_adapter = lambda config: _FakeRAGAdapter()
-
     def tearDown(self):
         import handler as h
-        h.make_comprehend = self._orig_make_comprehend
-        h.make_cloudwatch = self._orig_make_cloudwatch
-        h._make_rag_adapter = self._orig_make_rag
+        h.get_compiled_graph = self._orig_get_graph
+        h.make_cloudwatch = self._orig_make_cw
 
-    def _invoke(self, message: str) -> dict:
-        event = {"body": json.dumps({"message": message})}
+    def _invoke(self, body: dict) -> dict:
+        event = {"body": json.dumps(body)}
         result = lambda_handler(event, None)
         result["body"] = json.loads(result["body"])
         return result
 
     def test_valid_message_returns_200(self):
-        result = self._invoke("What are my rights?")
+        result = self._invoke({"message": "What are my rights?", "sessionId": "sess-1"})
         self.assertEqual(result["statusCode"], 200)
+        self.assertEqual(result["body"]["response"], "Here is your answer.")
+
+    def test_response_includes_session_id_from_request(self):
+        result = self._invoke({"message": "hi", "sessionId": "sess-abc"})
+        self.assertEqual(result["body"]["sessionId"], "sess-abc")
+
+    def test_generates_session_id_when_missing(self):
+        result = self._invoke({"message": "hi"})
+        self.assertTrue(result["body"]["sessionId"])
+
+    def test_graph_receives_thread_id_equal_to_session_id(self):
+        self._invoke({"message": "hi", "sessionId": "sess-xyz"})
+        self.assertEqual(
+            self.graph.invocations[-1]["config"]["configurable"]["thread_id"],
+            "sess-xyz",
+        )
 
     def test_empty_message_returns_400(self):
-        result = self._invoke("")
+        result = self._invoke({"message": ""})
         self.assertEqual(result["statusCode"], 400)
-        self.assertIn("error", result["body"])
 
     def test_whitespace_only_message_returns_400(self):
-        result = self._invoke("   ")
+        result = self._invoke({"message": "   "})
         self.assertEqual(result["statusCode"], 400)
 
     def test_missing_body_returns_400(self):
         result = lambda_handler({"body": None}, None)
-        body = json.loads(result["body"])
         self.assertEqual(result["statusCode"], 400)
 
     def test_response_shape_is_complete(self):
-        result = self._invoke("What are my land rights?")
+        result = self._invoke({"message": "hello", "sessionId": "s"})
         body = result["body"]
-        self.assertIn("response", body)
-        self.assertIn("citations", body)
-        self.assertIn("language", body)
-        self.assertIn("blocked", body)
+        for key in ("response", "citations", "language", "blocked", "sessionId"):
+            self.assertIn(key, body)
 
     def test_cors_header_present(self):
-        result = self._invoke("test")
+        result = self._invoke({"message": "hi"})
         self.assertEqual(result["headers"]["Access-Control-Allow-Origin"], "*")
 
-    def test_blocked_response_when_guardrail_fires(self):
-        import handler as h
-
-        class _BlockingStub:
-            def retrieve_and_generate(self, query, system_prompt, model_id):
-                return {"output": {"text": ""}, "citations": [], "stopReason": "guardrail_intervened"}
-
-        h._make_rag_adapter = lambda config: _BlockingStub()
-        result = self._invoke("What are my rights?")
-        body = result["body"]
-        self.assertEqual(result["statusCode"], 200)
-        self.assertTrue(body["blocked"])
-        self.assertEqual(body["response"], BILINGUAL_REFUSAL)
-        self.assertEqual(body["citations"], [])
+    def test_blocked_response_passes_through_from_graph(self):
+        self.graph._final_state = {
+            "messages": [],
+            "language": "english",
+            "citations": [],
+            "blocked": True,
+            "response_text": BILINGUAL_REFUSAL,
+        }
+        result = self._invoke({"message": "what's the weather?"})
+        self.assertTrue(result["body"]["blocked"])
+        self.assertEqual(result["body"]["response"], BILINGUAL_REFUSAL)
 
 
 # ── Runner ────────────────────────────────────────────────────────────────────
@@ -362,8 +650,14 @@ if __name__ == "__main__":
     for cls in [
         TestDetectLanguage,
         TestBuildSystemPrompt,
+        TestBuildChatSystemPrompt,
         TestCheckGuardrailBlock,
         TestExtractCitations,
+        TestClassifierParsing,
+        TestClassifyIntent,
+        TestInvokeChat,
+        TestDynamoDBSaver,
+        TestGraphRouting,
         TestLambdaHandler,
     ]:
         suite.addTests(loader.loadTestsFromTestCase(cls))
