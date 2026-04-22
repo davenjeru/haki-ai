@@ -7,6 +7,10 @@ dependencies = [
     "boto3>=1.42.91",
     "langgraph>=0.2.50",
     "langsmith>=0.1.0",
+    # rank_bm25 is a pure-Python BM25 implementation (no native deps) used by
+    # the advanced-RAG hybrid retriever. ~20KB wheel, loads in-process in
+    # Lambda with zero cold-start penalty beyond the import itself.
+    "rank-bm25>=0.2.2",
 ]
 
 # Local-only deps — chromadb pulls ~50MB of native wheels (hnswlib, onnx)
@@ -16,4 +20,11 @@ dependencies = [
 [dependency-groups]
 local = [
     "chromadb>=1.5.8",
+]
+# RAGAS pulls ~200MB of langchain + datasets + pyarrow that we never want
+# in the Lambda zip. Kept behind an opt-in group so CI can run a full
+# RAGAS sweep while dev-loop runs of `uv run -m evals.run` stay fast.
+evals = [
+    "ragas>=0.2.0",
+    "datasets>=2.19.0",
 ]
