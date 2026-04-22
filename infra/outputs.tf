@@ -27,3 +27,20 @@ output "lambda_name" {
   description = "Lambda function name"
   value       = module.compute.lambda_name
 }
+
+# ── Web distribution ─────────────────────────────────────────────────────────
+
+output "web_bucket" {
+  description = "S3 bucket the built frontend is synced to"
+  value       = length(module.web) > 0 ? module.web[0].site_bucket_name : ""
+}
+
+output "web_distribution_id" {
+  description = "CloudFront distribution ID (used for cache invalidation after a deploy)"
+  value       = length(module.web) > 0 ? module.web[0].distribution_id : ""
+}
+
+output "web_url" {
+  description = "Public URL of the deployed frontend"
+  value       = length(module.web) > 0 ? "https://${module.web[0].distribution_domain_name}" : ""
+}

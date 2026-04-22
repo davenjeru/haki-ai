@@ -50,3 +50,30 @@ destroy: _prod-init
 
 output: _prod-init
 	terraform output
+
+# ── Web deploy (prod frontend: build + S3 sync + CloudFront invalidation) ────
+# Usage:
+#   make deploy-web    # from infra/
+# Requires: VITE_API_BASE_URL set in frontend/.env.production (committed).
+
+.PHONY: deploy-web
+
+deploy-web: _prod-init
+	@BUCKET=$$(terraform output -raw web_bucket); \
+	 DIST=$$(terraform output -raw web_distribution_id); \
+	 URL=$$(terraform output -raw web_url); \
+	 if [ -z "$$BUCKET" ] || [ -z "$$DIST" ]; then \
+	   echo "Error: web module outputs are empty. Run 'make apply' first." >&2; exit 1; \
+	 fi; \
+	 echo ">>> building frontend"; \
+	 (cd ../frontend && npm ci --prefer-offline --no-audit --silent && npm run build); \
+	 echo ">>> syncing dist/ → s3://$$BUCKET/"; \
+	 aws s3 sync ../frontend/dist/ "s3://$$BUCKET/" --delete --only-show-errors \
+	   --cache-control "public, max-age=31536000, immutable" \
+	   --exclude 'index.html' --exclude '*.html'; \
+	 aws s3 sync ../frontend/dist/ "s3://$$BUCKET/" --only-show-errors \
+	   --cache-control "public, max-age=0, must-revalidate" \
+	   --exclude '*' --include '*.html'; \
+	 echo ">>> invalidating CloudFront ($$DIST)"; \
+	 aws cloudfront create-invalidation --distribution-id "$$DIST" --paths '/*' --query 'Invalidation.Id' --output text; \
+	 echo ">>> deployed to $$URL"

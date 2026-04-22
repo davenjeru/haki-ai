@@ -177,9 +177,9 @@ data "archive_file" "lambda_zip" {
 
   excludes = [
     ".venv",
-    ".local-vectorstore",     # local ChromaDB store — never used in prod
+    ".local-vectorstore", # local ChromaDB store — never used in prod
     ".local-vectorstore/**",
-    "modules",                # defensive: prevents any stray tf build artefacts from leaking in
+    "modules", # defensive: prevents any stray tf build artefacts from leaking in
     "modules/**",
     "__pycache__",
     "*.pyc",

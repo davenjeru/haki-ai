@@ -277,6 +277,29 @@ limitations apply, inject into lambda_handler — no changes to business logic f
   - `make apply` / `make destroy` / `make output` (prod)
 - Prod apply requires `TF_VAR_langsmith_api_key` (else tracing is disabled cleanly).
 
+## Frontend hosting (prod)
+- S3 bucket `haki-ai-web` (private, blocked-public) + CloudFront distribution.
+- CloudFront Origin Access Control (OAC, SigV4) — bucket only accepts
+  requests from this distribution. No public-read bucket policy.
+- Price class `PriceClass_100` (US + Canada + Europe edges only). Flip
+  `cloudfront_price_class` in terraform.tfvars to widen coverage.
+- SPA rewrite: S3 403/404 → `/index.html` with 200 so React Router can
+  handle any path client-side.
+- Cache headers: hashed assets (`/assets/*`) are `max-age=31536000,
+  immutable`; `*.html` is `max-age=0, must-revalidate`. Set by
+  `make deploy-web` on the `aws s3 sync` calls.
+- Default domain only (`*.cloudfront.net`) — custom domain + ACM cert
+  is a future add-on.
+
+### Deploy
+```
+cd infra && make deploy-web    # npm ci + vite build + s3 sync + invalidation
+```
+The target reads the distribution id and bucket name from terraform
+outputs, so a fresh prod apply plus `make deploy-web` puts a new build
+live in roughly 1 minute (build) + a couple of minutes for cache
+invalidation to complete at every edge.
+
 ## Frontend (frontend/)
 - React + Vite + Tailwind v4 (@tailwindcss/vite plugin)
 - Custom color tokens defined in index.css via @theme block:

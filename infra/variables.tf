@@ -74,3 +74,9 @@ variable "langsmith_endpoint" {
   type        = string
   default     = "https://api.smith.langchain.com"
 }
+
+variable "cloudfront_price_class" {
+  description = "CloudFront price class for the web distribution. PriceClass_100 = cheapest (US/CA/EU)."
+  type        = string
+  default     = "PriceClass_100"
+}

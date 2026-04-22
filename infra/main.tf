@@ -148,3 +148,15 @@ module "ml" {
   project_name   = var.project_name
   data_bucket_id = module.storage.data_bucket_id
 }
+
+# ── Web: S3 + CloudFront hosting for the built Vite SPA ──────────────────────
+# LocalStack's CloudFront support is limited, so the web module is prod-only.
+# For local frontend dev, `npm run dev` hits the Vite dev server directly.
+
+module "web" {
+  count = local.is_local ? 0 : 1
+
+  source       = "./modules/web"
+  project_name = var.project_name
+  price_class  = var.cloudfront_price_class
+}
