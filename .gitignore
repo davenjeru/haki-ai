@@ -18,6 +18,8 @@ infra/*.tfstate
 infra/*.tfstate.backup
 infra/terraform.tfvars.local
 infra/modules/compute/lambda.zip
+infra/modules/compute/lambda-layer.zip
+infra/modules/compute/.layer-build/
 
 # LocalStack volume (certs + license)
 pipeline/volume/

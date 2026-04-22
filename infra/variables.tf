@@ -27,9 +27,9 @@ variable "alert_email" {
 }
 
 variable "bedrock_model_id" {
-  description = "Bedrock foundation model for generation"
+  description = "Bedrock foundation model for generation. Must be an inference-profile ID (prefixed `us.`) since Claude 4.x models no longer support on-demand throughput."
   type        = string
-  default     = "anthropic.claude-sonnet-4-6"
+  default     = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
 }
 
 variable "embedding_model_id" {

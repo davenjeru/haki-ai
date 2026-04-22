@@ -105,22 +105,48 @@ resource "aws_bedrockagent_data_source" "laws" {
 
 resource "aws_bedrock_guardrail" "this" {
   name        = "${var.project_name}-guardrail"
-  description = "Blocks non-Kenyan-law questions with a bilingual refusal message"
+  description = "Defence-in-depth safety layer: blocks hateful, violent, and sexual content. Scope (Kenyan-law only) is enforced by the system prompt + classifier, not by topic policy."
 
   blocked_input_messaging   = "Mimi ni msaidizi wa kisheria wa Kenya tu. / I can only help with Kenyan legal matters."
   blocked_outputs_messaging = "Mimi ni msaidizi wa kisheria wa Kenya tu. / I can only help with Kenyan legal matters."
 
-  topic_policy_config {
-    topics_config {
-      name       = "off-topic"
-      definition = "Any question not related to Kenyan law, the Constitution of Kenya, employment law, or land law."
-      examples = [
-        "What is the weather today?",
-        "Tell me a joke",
-        "Who won the election?",
-        "Write me a poem"
-      ]
-      type = "DENY"
+  # Note: an earlier version of this resource used a topic_policy_config
+  # with a negative definition ("Any question not related to Kenyan law").
+  # Negative topic definitions are over-aggressive in practice — the
+  # classifier flagged legitimate questions like "What does section 40 of
+  # the Employment Act say?" as off-topic and blocked them. Scope is now
+  # enforced exclusively by:
+  #   1. prompts.build_system_prompt() — the model's behavioural instruction
+  #   2. classifier.classify_intent() — routes non-legal chat away from RAG
+  #
+  # Bedrock requires at least one policy on every guardrail, so we keep
+  # a HIGH-severity harmful-content filter as the single active policy.
+  # This acts as a baseline safety net without affecting the core legal Q&A.
+  content_policy_config {
+    # Explicit tier avoids a TF provider drift warning where the API
+    # defaults to CLASSIC but the resource schema leaves it null.
+    tier_config {
+      tier_name = "CLASSIC"
+    }
+    filters_config {
+      type            = "HATE"
+      input_strength  = "HIGH"
+      output_strength = "HIGH"
+    }
+    filters_config {
+      type            = "VIOLENCE"
+      input_strength  = "HIGH"
+      output_strength = "HIGH"
+    }
+    filters_config {
+      type            = "SEXUAL"
+      input_strength  = "HIGH"
+      output_strength = "HIGH"
+    }
+    filters_config {
+      type            = "INSULTS"
+      input_strength  = "HIGH"
+      output_strength = "HIGH"
     }
   }
 }

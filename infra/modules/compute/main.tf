@@ -46,7 +46,10 @@ resource "aws_iam_role_policy" "lambda_policy" {
           Action   = ["cloudwatch:PutMetricData"]
           Resource = "*"
         },
-        # Bedrock — RAG via Knowledge Base (steps 3–5; stubs until handler is complete)
+        # Bedrock — RAG via Knowledge Base + direct InvokeModel.
+        # GetInferenceProfile is required to call Claude 4.x models, which
+        # only support cross-region inference and are referenced by
+        # inference-profile IDs like `us.anthropic.claude-haiku-4-5-...`.
         {
           Effect = "Allow"
           Action = [
@@ -54,6 +57,8 @@ resource "aws_iam_role_policy" "lambda_policy" {
             "bedrock:Retrieve",
             "bedrock:InvokeModel",
             "bedrock:ApplyGuardrail",
+            "bedrock:GetInferenceProfile",
+            "bedrock:ListInferenceProfiles",
           ]
           Resource = "*"
         },
@@ -94,8 +99,75 @@ resource "aws_iam_role_policy" "lambda_policy" {
   })
 }
 
+# ── Lambda dependency layer ──────────────────────────────────────────────────
+# The Lambda runtime ships boto3 but not langgraph / langchain-core / langsmith.
+# We install those deps into a layer at apply-time using uv, targeting Linux
+# x86_64 wheels so native extensions (msgpack, ormsgpack, etc.) are compatible
+# with the Lambda execution environment.
+#
+# chromadb is excluded via the `local` dependency group in pyproject.toml so
+# `uv export --frozen` never emits it — keeps the layer under the 250MB cap.
+
+resource "terraform_data" "lambda_layer_build" {
+  # Rebuild whenever deps or the lock change.
+  triggers_replace = {
+    pyproject = filesha256("${path.module}/../../../backend/pyproject.toml")
+    uvlock    = filesha256("${path.module}/../../../backend/uv.lock")
+  }
+
+  provisioner "local-exec" {
+    command = <<-EOT
+      set -euo pipefail
+      BUILD_DIR="${abspath(path.module)}/.layer-build/python"
+      rm -rf "${abspath(path.module)}/.layer-build"
+      mkdir -p "$BUILD_DIR"
+      # Freeze the runtime deps only (no dev or local groups).
+      uv export \
+        --project "${abspath("${path.module}/../../../backend")}" \
+        --frozen --no-emit-project --no-dev \
+        -o /tmp/haki-lambda-reqs.txt
+      # Install into the layer dir with Linux x86_64 wheels so msgpack et al. work.
+      uv pip install \
+        -r /tmp/haki-lambda-reqs.txt \
+        --target "$BUILD_DIR" \
+        --python-platform x86_64-manylinux2014 \
+        --python-version 3.12 \
+        --only-binary=:all:
+      # Trim site-packages aggressively to stay well under the 250MB
+      # uncompressed Lambda layer cap and keep the upload fast.
+      #   - boto3/botocore/s3transfer: already present in the Lambda runtime.
+      #   - zstandard: langsmith optional compression backend; falls back to gzip.
+      #   - tests/, __pycache__, *.pyc: never needed at runtime.
+      find "$BUILD_DIR" -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true
+      find "$BUILD_DIR" -name '*.pyc' -delete 2>/dev/null || true
+      find "$BUILD_DIR" -name 'tests' -type d -prune -exec rm -rf {} + 2>/dev/null || true
+      rm -rf \
+        "$BUILD_DIR"/boto3 "$BUILD_DIR"/boto3-*.dist-info \
+        "$BUILD_DIR"/botocore "$BUILD_DIR"/botocore-*.dist-info \
+        "$BUILD_DIR"/s3transfer "$BUILD_DIR"/s3transfer-*.dist-info \
+        "$BUILD_DIR"/zstandard "$BUILD_DIR"/zstandard-*.dist-info 2>/dev/null || true
+    EOT
+  }
+}
+
+data "archive_file" "lambda_layer_zip" {
+  depends_on  = [terraform_data.lambda_layer_build]
+  type        = "zip"
+  source_dir  = "${path.module}/.layer-build"
+  output_path = "${path.module}/lambda-layer.zip"
+}
+
+resource "aws_lambda_layer_version" "deps" {
+  filename            = data.archive_file.lambda_layer_zip.output_path
+  source_code_hash    = data.archive_file.lambda_layer_zip.output_base64sha256
+  layer_name          = "${var.project_name}-deps"
+  compatible_runtimes = ["python3.12"]
+  description         = "LangGraph + LangChain + LangSmith and transitive deps (x86_64-manylinux2014)"
+}
+
 # ── Lambda packaging ──────────────────────────────────────────────────────────
-# Zips the full backend/ directory. boto3 is already in the Lambda runtime.
+# Zips the full backend/ directory. boto3 is already in the Lambda runtime and
+# langchain/langgraph/langsmith live in the layer above.
 # Excludes the uv virtual env, cache, and test files — these must not be deployed.
 
 data "archive_file" "lambda_zip" {
@@ -105,6 +177,10 @@ data "archive_file" "lambda_zip" {
 
   excludes = [
     ".venv",
+    ".local-vectorstore",     # local ChromaDB store — never used in prod
+    ".local-vectorstore/**",
+    "modules",                # defensive: prevents any stray tf build artefacts from leaking in
+    "modules/**",
     "__pycache__",
     "*.pyc",
     "test_*.py",  # test runners — committed to git, not needed in Lambda
@@ -123,6 +199,8 @@ resource "aws_lambda_function" "handler" {
   handler          = "handler.lambda_handler"
   filename         = data.archive_file.lambda_zip.output_path
   source_code_hash = data.archive_file.lambda_zip.output_base64sha256
+  layers           = [aws_lambda_layer_version.deps.arn]
+  architectures    = ["x86_64"]
 
   # 30s is well within the Bedrock KB p95 latency budget
   timeout     = 30

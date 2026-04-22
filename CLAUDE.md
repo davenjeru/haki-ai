@@ -152,6 +152,32 @@ Routing examples:
 }
 ```
 
+### S3 Vectors filterable metadata budget (2048-byte cap per vector)
+Bedrock KB automatically injects two very large attributes when ingesting
+into S3 Vectors — `AMAZON_BEDROCK_TEXT` (entire chunk body) and
+`AMAZON_BEDROCK_METADATA` (JSON blob with source/page info). If left as
+filterable they blow the 2048-byte cap and ingestion fails with
+`Filterable metadata must have at most 2048 bytes`.
+
+The S3 Vectors index in `infra/modules/storage/main.tf` must mark them
+non-filterable, along with our own display-only fields:
+
+```hcl
+metadata_configuration {
+  non_filterable_metadata_keys = [
+    "AMAZON_BEDROCK_METADATA",  # Required by Bedrock KB + S3 Vectors
+    "AMAZON_BEDROCK_TEXT",      # Required by Bedrock KB + S3 Vectors
+    "chapter",                   # Long Constitution strings, display only
+    "title",                     # Display only
+    "pageImageKey",              # Long S3 key, re-presigned on demand
+  ]
+}
+```
+
+Only `source`, `section`, and `chunkId` stay filterable — small strings
+that would let us filter retrievals by act or section number later.
+The pipeline's sidecar output does NOT need changes for this.
+
 ### S3 layout
     raw-laws/           ← original PDFs
     page-images/        ← single-page PDFs per page per law

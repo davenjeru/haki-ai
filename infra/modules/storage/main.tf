@@ -68,6 +68,27 @@ resource "aws_s3vectors_index" "kb" {
   data_type          = "float32"
   dimension          = 1024
   distance_metric    = "cosine"
+
+  # S3 Vectors caps filterable metadata at 2048 bytes per vector. Two
+  # sources push past that:
+  #   1. Our own chapter/title/pageImageKey strings — long for the
+  #      Constitution, especially. Never used as filters (UI display only).
+  #   2. Bedrock KB automatically injects AMAZON_BEDROCK_TEXT (full chunk
+  #      body) and AMAZON_BEDROCK_METADATA (JSON blob with source/pages)
+  #      as filterable attributes. A single ~500-token chunk alone blows
+  #      the budget. AWS requires both of these marked non-filterable
+  #      when using S3 Vectors as the KB vector store.
+  # source / section / chunkId stay filterable in case we want to narrow
+  # retrieval by them later (e.g. "Constitution only" filters).
+  metadata_configuration {
+    non_filterable_metadata_keys = [
+      "AMAZON_BEDROCK_METADATA",
+      "AMAZON_BEDROCK_TEXT",
+      "chapter",
+      "title",
+      "pageImageKey",
+    ]
+  }
 }
 
 # ── LangGraph checkpoint store (DynamoDB) ─────────────────────────────────────
