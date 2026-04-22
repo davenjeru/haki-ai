@@ -60,15 +60,45 @@ jobs:
       # Pre-create an empty skeleton so the data source has something to
       # read; the terraform_data step then rm -rf's and rebuilds it with
       # the real layer contents.
-      - name: Pre-create empty Lambda layer skeleton
-        # `archive_file` refuses to produce an empty zip ("archive has not
-        # been created as it would be empty"), so drop a 1-byte placeholder.
-        # The terraform_data resource rm -rf's the whole directory before it
-        # installs the real deps, so the placeholder never makes it into the
-        # real Lambda layer zip.
+      # The Lambda layer build is driven by a `terraform_data` resource
+      # whose `triggers_replace` is the sha of backend/pyproject.toml +
+      # backend/uv.lock. On CI, remote state usually shows that resource
+      # as already-built (the deps haven't changed), so Terraform's
+      # refresh skips the local-exec — but the CI runner doesn't have
+      # the `.layer-build/` directory that an earlier local apply
+      # populated, so the downstream `archive_file` + `aws_lambda_layer_version`
+      # end up trying to publish an empty zip.
+      #
+      # To avoid relying on state, we always build the layer here in CI
+      # before running Terraform. The terraform_data resource becomes a
+      # no-op if the triggers haven't changed, and the populated directory
+      # makes archive_file produce a valid zip either way.
+      - name: Build Lambda dependency layer
         run: |
-          mkdir -p infra/modules/compute/.layer-build/python
-          : > infra/modules/compute/.layer-build/python/.keep
+          set -euo pipefail
+          BUILD_DIR="infra/modules/compute/.layer-build/python"
+          rm -rf "infra/modules/compute/.layer-build"
+          mkdir -p "$BUILD_DIR"
+          uv export \
+            --project backend \
+            --frozen --no-emit-project --no-dev \
+            -o /tmp/haki-lambda-reqs.txt
+          uv pip install \
+            -r /tmp/haki-lambda-reqs.txt \
+            --target "$BUILD_DIR" \
+            --python 3.12 \
+            --python-platform x86_64-manylinux_2_28 \
+            --python-version 3.12 \
+            --only-binary=:all:
+          find "$BUILD_DIR" -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true
+          find "$BUILD_DIR" -name '*.pyc' -delete 2>/dev/null || true
+          find "$BUILD_DIR" -name 'tests' -type d -prune -exec rm -rf {} + 2>/dev/null || true
+          rm -rf \
+            "$BUILD_DIR"/boto3 "$BUILD_DIR"/boto3-*.dist-info \
+            "$BUILD_DIR"/botocore "$BUILD_DIR"/botocore-*.dist-info \
+            "$BUILD_DIR"/s3transfer "$BUILD_DIR"/s3transfer-*.dist-info \
+            "$BUILD_DIR"/zstandard "$BUILD_DIR"/zstandard-*.dist-info 2>/dev/null || true
+          du -sh "$BUILD_DIR"
 
       - name: Terraform init
         working-directory: infra
