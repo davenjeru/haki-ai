@@ -1,144 +1,193 @@
 # Haki AI — Project Context
 
 ## What this is
-A Kenyan legal aid agent that answers questions about Kenyan law
-in English and Swahili, with citations to specific Act, Chapter, and Section.
+A Kenyan legal-aid agent that answers questions about Kenyan law in
+English and Swahili, with citations to specific Act, Chapter, and
+Section. Built around a two-tier multi-agent LangGraph with an
+advanced RAG pipeline (hybrid retrieval + rerank) and an optional
+fine-tuned Llama-3.1-8B fallback.
 
 ## Stack
-- Frontend: React (chat UI + citation renderer + language-aware placeholder)
-- Backend: Python Lambda (agent orchestrator)
-- IaC: Terraform (modular)
-- RAG pipeline: custom chunking pipeline (TypeScript, LiteParse OCR + Haiku
-  LLM extraction) → S3 pre-chunked .txt files → Bedrock KB (embedding +
-  retrieval + generation via retrieve_and_generate)
-- Vector store: S3 Vectors (storage backend for Bedrock KB)
-- Raw data: S3 standard bucket (law PDFs + fine-tuning data)
-- Language detection: AWS Comprehend (returns english / swahili / mixed)
-- Guardrails: Amazon Bedrock Guardrails (topic denial for out-of-scope)
-- Fine-tuning: SageMaker (qLoRA / PEFT)
-- Monitoring: CloudWatch (custom metrics, alarms, dashboard, SNS alerts)
+- Frontend: React + Vite + Tailwind v4, full EN/SW i18n with auto
+  language switch driven by the backend's Comprehend detection.
+- Backend: Python 3.12 Lambda orchestrating a LangGraph StateGraph
+  with DynamoDB checkpointing for multi-turn memory.
+- RAG: pre-chunking pipeline (TypeScript + LiteParse OCR + Haiku
+  extraction) → Bedrock KB over S3 Vectors → advanced-RAG pipeline
+  (query expansion, hybrid BM25+dense, RRF, TOC filter, Cohere rerank).
+- Data sources: Kenyan Acts (Constitution 2010, Employment 2007,
+  Land 2012) + SheriaPlex forum Q&A crawl + KenyaLaw case summaries,
+  all tagged with a filterable `corpus` metadata key.
+- Fine-tuning: SageMaker qLoRA on Llama-3.1-8B-Instruct with a
+  `USE_FINETUNED_MODEL` feature flag and Bedrock fallback.
+- Evaluation: RAGAS (faithfulness / answer_relevancy /
+  context_precision / context_recall) + LLM-as-judge on 4 axes.
+- IaC: Terraform modular. GitHub Actions for CI, deploy, nightly evals.
+- Observability: LangSmith per-turn tracing + CloudWatch metrics,
+  alarms, dashboards, and SNS alerts.
 
-## Laws covered
-- Constitution of Kenya 2010
-- Employment Act 2007
-- Land Act 2012
+## System architecture
 
-## Project structure
+```mermaid
+flowchart TB
+  subgraph Client
+    fe[React + Vite frontend<br/>EN/SW i18n + LanguageToggle]
+  end
+
+  subgraph AWS
+    apigw[API Gateway HTTP]
+    lam[Lambda: app.handler]
+    ddb[(DynamoDB<br/>LangGraph checkpoints)]
+    kb[(Bedrock KB<br/>S3 Vectors index)]
+    br[Bedrock Claude + Titan + Rerank]
+    cmp[Comprehend]
+    sm[SageMaker endpoint<br/>Llama-3.1-8B qLoRA]
+    s3[(S3 haki-ai-data<br/>raw-laws, chunks, faq-chunks)]
+    cw[(CloudWatch<br/>metrics + alarms)]
+    sns[SNS email alerts]
+  end
+
+  fe -->|/chat| apigw --> lam
+  lam --> ddb
+  lam --> cmp
+  lam --> kb --> s3
+  lam --> br
+  lam -.USE_FINETUNED_MODEL.-> sm
+  lam --> cw --> sns
+
+  subgraph Pipeline
+    raw[(data/raw PDFs)] --> pipe[pipeline: OCR + Haiku extract + chunk]
+    pipe --> s3
+    s3 --> ing[ingestion_trigger Lambda]
+    ing --> kb
+  end
+
+  subgraph Dev
+    crawl[pipeline crawl-sheriaplex] --> s3
+    ls[(LangSmith traces)]
+    lam -.optional.-> ls
+  end
+```
+
+## LangGraph agent flow
+
+```mermaid
+flowchart LR
+  start[user turn] --> lang[detect_language<br/>Comprehend]
+  lang --> sup[supervisor<br/>Haiku routing]
+  sup -->|chat| chat[ChatAgent]
+  sup -->|1–3 specialists| fan{{Send fan-out}}
+  fan --> c[ConstitutionAgent]
+  fan --> e[EmploymentAgent]
+  fan --> l[LandAgent]
+  fan --> f[FAQAgent]
+  c --> pipe[rag.pipeline]
+  e --> pipe
+  l --> pipe
+  f --> pipe
+  pipe --> syn[synthesizer]
+  chat --> syn
+  syn --> outn[response + citations + language]
+```
+
+## Project layout
+```
 haki-ai/
-├── frontend/
+├── frontend/              # React + Vite + Tailwind, i18n
 ├── backend/
-│   ├── handler.py         # Lambda entry point — thin wrapper around the LangGraph
-│   ├── graph.py           # LangGraph StateGraph: detect_language → classify_intent → {rag_node|chat_node}
-│   ├── classifier.py      # Haiku-based intent classifier (needs_rag true/false)
-│   ├── chat_node.py       # Direct invoke_model for conversational (no-RAG) turns
-│   ├── checkpointer.py    # DynamoDBSaver — persistent LangGraph memory
-│   ├── config.py          # single source of truth for env vars
-│   ├── clients.py         # boto3 factory (make_comprehend, make_bedrock, make_dynamodb_table, etc.)
-│   ├── adapters.py        # ComprehendAdapter + LocalRAGAdapter + BedrockRAGAdapter
-│   ├── prompts.py         # system prompts: RAG, chat-only, and classifier
-│   ├── rag.py             # retrieve_and_generate + guardrail check + KB sessionId threading
-│   ├── citations.py       # citation extraction
-│   ├── metrics.py         # CloudWatch metric emission
-│   ├── ingest_local.py    # one-time local ingestion: S3 chunks → ChromaDB [local only]
-│   ├── server_local.py    # local HTTP server for frontend dev (port 8080) [local only]
-│   ├── test_unit.py       # 60 unit tests — no AWS required [local only]
-│   ├── test_e2e_local.py  # in-process end-to-end RAG test [local only]
-│   └── test_language_detection.py  # language detection test runner [local only]
-├── pipeline/              # local data prep (TypeScript, LiteParse)
-│   └── src/
-├── data/
-│   └── raw/              # Kenyan law PDFs (committed — required for pipeline)
-└── infra/
-    ├── main.tf
-    ├── variables.tf
-    ├── outputs.tf
-    ├── terraform.tfvars
-    └── modules/
-        ├── storage/       # S3 standard + S3 Vectors buckets
-        ├── compute/       # Lambda + IAM role
-        ├── api/           # API Gateway HTTP + CORS + CloudWatch logs
-        ├── ai/            # Bedrock KB + Guardrails
-        ├── ml/            # SageMaker qLoRA job
-        └── observability/ # CloudWatch alarms, dashboard, SNS alerts
+│   ├── app/               # handler.py, graph.py, config.py, server_local.py, ingest_local.py
+│   ├── agents/            # supervisor, specialists, chat, synthesizer, classifier
+│   ├── rag/               # query_expansion, hybrid_retriever, bm25, rrf, filters, reranker, citations, generator, sagemaker_generator
+│   ├── clients/           # boto3 factory + ComprehendAdapter / BedrockRAGAdapter / LocalRAGAdapter
+│   ├── memory/            # DynamoDBSaver checkpointer
+│   ├── observability/     # LangSmith tracing + CloudWatch metrics
+│   ├── prompts/           # all LLM prompts
+│   ├── evals/             # golden_set.jsonl + RAGAS + llm_judge + report writer
+│   ├── tests/             # unit + e2e
+│   └── scripts/           # offline helpers (prepare_finetune_data.py)
+├── pipeline/              # TypeScript: PDF → pages → chunks + SheriaPlex crawler
+├── data/raw/              # committed Kenyan law PDFs
+├── infra/
+│   └── modules/
+│       ├── storage/       # S3 + S3 Vectors index (corpus filterable)
+│       ├── compute/       # Lambda + DynamoDB + ingestion_trigger
+│       ├── api/           # API Gateway HTTP
+│       ├── ai/            # Bedrock KB + Guardrails
+│       ├── ml/            # SageMaker fine-tune + endpoint (scale-to-zero)
+│       └── observability/ # alarms + dashboard + SNS
+├── .github/workflows/     # ci.yml, deploy.yml, eval-nightly.yml
+└── scripts/               # bootstrap.sh, run-finetune.sh
+```
+
+## Per-package docs
+Each backend package has its own diagram-led one-pager:
+
+- [backend/app](backend/app/CLAUDE.md) — entry points (Lambda, local server, ingestion CLI)
+- [backend/agents](backend/agents/CLAUDE.md) — supervisor + specialists + synthesizer
+- [backend/rag](backend/rag/CLAUDE.md) — advanced RAG pipeline stages
+- [backend/clients](backend/clients/CLAUDE.md) — boto3 factory + adapters
+- [backend/memory](backend/memory/CLAUDE.md) — DynamoDB checkpointer
+- [backend/observability](backend/observability/CLAUDE.md) — tracing + metrics
+- [backend/prompts](backend/prompts/CLAUDE.md) — LLM prompt templates
+- [backend/evals](backend/evals/CLAUDE.md) — RAGAS + LLM-judge harness
+- [backend/tests](backend/tests/CLAUDE.md) — test suite
 
 ## Key architecture decisions
-- Chunking is fully custom (not delegated to Bedrock KB):
-    1. LiteParse OCR extracts raw text per page in 10-page batches
-    2. Claude Haiku (Bedrock InvokeModel) identifies section boundaries per page
-    3. assembleChunks() walks pages in order, accumulating lines per section
-    4. splitToSegments() splits long sections at paragraph breaks (~500 tokens)
-    5. Pre-chunked .txt files + .txt.metadata.json sidecars uploaded to S3
-  Bedrock KB only handles embedding + retrieval + generation (retrieve_and_generate).
-- S3 Vectors is the vector store backend for Bedrock KB (serverless,
-  cheapest option, GA December 2025)
-- Bedrock KB syncs from pre-chunked .txt files in S3 via start_ingestion_job
-- Each chunk has a .txt.metadata.json sidecar (Bedrock KB native format)
-  carrying { source, chapter, section, title } for citation accuracy
-- Language detection via Comprehend → dynamic system prompt per language
-- Three-layer guardrails:
-    1. System prompt instructs model to refuse out-of-scope
-    2. Bedrock Guardrails intercepts before model sees request
-    3. Lambda checks stopReason == "guardrail_intervened"
-- Bilingual refusal: "Mimi ni msaidizi wa kisheria wa Kenya tu. /
-  I can only help with Kenyan legal matters."
-- Every response must cite Act + Chapter + Section
 
-## Lambda core logic (handler.py + graph.py)
-`handler.py` is a thin wrapper that parses { message, sessionId } and invokes
-a compiled LangGraph with `thread_id = sessionId`. All orchestration lives
-in `graph.py` as a StateGraph:
+### Advanced RAG (Phase 1)
+The single `retrieve_and_generate` call was split into a pipeline
+(`rag/pipeline.py`) with: HyDE-style query expansion (3 variants),
+dense retrieval via Bedrock KB + in-memory BM25 over `processed-chunks`,
+Reciprocal Rank Fusion, TOC filter (chunks tagged `chunkType=toc` at
+pipeline time are excluded), Cohere Rerank v3.5 on Bedrock, citation
+dedup by `(source, section)`, then Claude `invoke_model` for generation.
+`LocalRAGAdapter` runs the same pipeline against ChromaDB so dev/prod
+parity holds.
 
-```
-START → detect_language → classify_intent → [ rag_node | chat_node ] → END
-```
+### Two-tier multi-agent (Phase 2)
+`SupervisorRouter` (Haiku, JSON) picks 1–3 specialists or `chat`.
+Each specialist is a sub-agent that runs the advanced-RAG pipeline
+scoped by `source` / `corpus` filter. `Synthesizer` merges ≥2
+specialist outputs; single-specialist turns pass through verbatim.
+Fan-out uses LangGraph's `Send()` with an `operator.add` reducer on
+`specialist_outputs`.
 
-Per-node work:
-1. `detect_language` — Comprehend → english / swahili / mixed
-2. `classify_intent` — Haiku returns `{"needs_rag": bool}` from full history
-3a. `rag_node` — Bedrock KB retrieve_and_generate (threads KB sessionId),
-    guardrail check, citation extraction
-3b. `chat_node` — direct Claude invoke_model with message history, no citations
-4. Handler emits CloudWatch metrics and returns
-   { response, citations, language, blocked, sessionId }
+### Evaluation harness (Phase 3)
+30-question golden set, RAGAS (optional dep), LLM-as-judge on 4 axes,
+markdown reports + `EvalScore` CloudWatch metric. CI blocks PRs on
+eval-score regressions >5%.
 
-Memory: DynamoDBSaver persists the full state (messages + kb_session_id)
-keyed by thread_id. Survives Lambda cold starts and server_local.py restarts.
-TTL on `expires_at` auto-purges abandoned sessions after 30 days.
+### Problem-solution fit (Phase 4)
+- SheriaPlex forum + KenyaLaw case summaries are crawled into
+  `faq-chunks/` with `corpus=faq` metadata so the `FAQAgent` can
+  filter them and statute specialists can exclude them.
+- Fine-tune: SageMaker qLoRA on Llama-3.1-8B-Instruct, deployed as a
+  serverless scale-to-zero endpoint. `USE_FINETUNED_MODEL=true`
+  routes generation to it with automatic Bedrock fallback on error.
+- Frontend i18n covers ~30 UI strings in EN + SW, auto-switches locale
+  on detected Swahili responses, `manualLocaleOverride` persists user
+  intent in `localStorage`.
 
-Routing examples:
-- "My name is Dave"           → chat_node (no citations)
-- "What is my name?"          → chat_node (reads history from checkpointer)
-- "What does section 40 say?" → rag_node (Bedrock KB + citations)
-- "Thanks!"                   → chat_node (no citations)
+### Deployment maturity (Phase 5)
+- `make setup` bootstraps state bucket, copies `.env.example` → `.env`,
+  installs backend/pipeline/frontend deps, and applies the local
+  LocalStack infra — one command from a fresh clone.
+- `ingestion_trigger` Lambda debounces S3 EventBridge events for
+  `processed-chunks/` + `faq-chunks/` and calls
+  `bedrock-agent.start_ingestion_job` — dropping a new Act PDF and
+  running the pipeline re-indexes the KB with no human in the loop.
+- `.github/workflows/ci.yml` (tests + evals on PR),
+  `deploy.yml` (OIDC → terraform apply + deploy-web + ingest
+  net-new PDFs), `eval-nightly.yml` (RAGAS report posted to main).
 
-## PDF pipeline (pipeline/)
-- Runtime: TypeScript / Node.js (local scripts, not Lambda)
-- Two-script pipeline — run in order:
+### Separation of concerns (Phase 6)
+`backend/` is packaged by concern: `app/`, `agents/`, `rag/`,
+`clients/`, `memory/`, `observability/`, `prompts/`, `evals/`,
+`tests/`. Lambda ships only the runtime-relevant subset (tests, evals,
+scripts, `*_local.py` excluded). Each package has its own
+`CLAUDE.md` with a mermaid diagram.
 
-### Script 1: `npm run dev` (src/run.ts) — Page extraction
-- LiteParse (@llamaindex/liteparse) with OCR, processes in 10-page batches
-- pdf-lib extracts each page as a single-page PDF (no rendering, fast)
-- Uploads per page:
-    page-images/{shortId}/page-{n}.pdf   ← single-page PDF for citation carousel
-    page-text/{shortId}/page-{n}.txt     ← raw OCR text for LLM chunking
-- Also uploads raw-laws/{filename} (original PDF)
-
-### Script 2: `npm run chunk` (src/chunk-laws.ts) — LLM-assisted chunking
-- For each page, calls Claude Haiku (us.anthropic.claude-haiku-4-5-20251001-v1:0)
-  via Bedrock InvokeModel to extract structured section metadata as JSON:
-    { chapterOrPart: string|null, sections: [{ number, title, bodyStartLine }] }
-- Haiku results cached to S3 at page-extractions/{shortId}/page-{n}.json
-  so re-runs skip already-processed pages (resume-safe after throttling)
-- Concurrency capped at 2 with exponential backoff + jitter on ThrottlingException
-- assembleChunks() walks extractions in page order, accumulating lines per section
-  across page boundaries
-- Uploads per section chunk:
-    processed-chunks/{chunkId}.txt
-    processed-chunks/{chunkId}.txt.metadata.json  ← Bedrock KB sidecar format
-- Writes processed-chunks/{shortId}/.complete marker after successful upload
-  (idempotency: re-runs skip completed laws entirely)
-
-### Chunk metadata sidecar format (Bedrock KB native)
+## Chunk metadata sidecar (Bedrock KB native)
 ```json
 {
   "metadataAttributes": {
@@ -147,208 +196,51 @@ Routing examples:
     "section": "Section 40",
     "title": "Termination of employment",
     "chunkId": "employment-act-2007-part-iii-section-40",
-    "pageImageKey": "page-images/employment-act-2007/page-40.pdf"
+    "pageImageKey": "page-images/employment-act-2007/page-40.pdf",
+    "chunkType": "body",
+    "corpus": "statute"
   }
 }
 ```
 
-### S3 Vectors filterable metadata budget (2048-byte cap per vector)
-Bedrock KB automatically injects two very large attributes when ingesting
-into S3 Vectors — `AMAZON_BEDROCK_TEXT` (entire chunk body) and
-`AMAZON_BEDROCK_METADATA` (JSON blob with source/page info). If left as
-filterable they blow the 2048-byte cap and ingestion fails with
-`Filterable metadata must have at most 2048 bytes`.
-
-The S3 Vectors index in `infra/modules/storage/main.tf` must mark them
-non-filterable, along with our own display-only fields:
-
-```hcl
-metadata_configuration {
-  non_filterable_metadata_keys = [
-    "AMAZON_BEDROCK_METADATA",  # Required by Bedrock KB + S3 Vectors
-    "AMAZON_BEDROCK_TEXT",      # Required by Bedrock KB + S3 Vectors
-    "chapter",                   # Long Constitution strings, display only
-    "title",                     # Display only
-    "pageImageKey",              # Long S3 key, re-presigned on demand
-  ]
-}
-```
-
-Only `source`, `section`, and `chunkId` stay filterable — small strings
-that would let us filter retrievals by act or section number later.
-The pipeline's sidecar output does NOT need changes for this.
-
-### S3 layout
-    raw-laws/           ← original PDFs
-    page-images/        ← single-page PDFs per page per law
-    page-text/          ← raw OCR text per page per law
-    page-extractions/   ← cached Haiku JSON extractions (resume support)
-    processed-chunks/   ← .txt + .txt.metadata.json for Bedrock KB
-
-### Run order (prod)
-terraform apply → npm run dev → npm run chunk → start_ingestion_job
-
-### Run order (local)
-localstack start -d → terraform apply → npm run dev → npm run chunk → ENV=local uv run ingest_local.py
-
-### To re-process a law
-aws s3 rm s3://haki-ai-data/processed-chunks/{shortId}/.complete
-aws s3 rm s3://haki-ai-data/processed-chunks/ --recursive --exclude "*" --include "{shortId}-*"
-aws s3 rm s3://haki-ai-data/page-extractions/{shortId}/ --recursive
-
-## Backend module structure (backend/)
-Three separation layers keep handler.py a thin orchestrator:
-- config.py   — load_config() reads all env vars once; returns frozen Config dataclass
-                 Fields: is_local, localstack_endpoint, aws_region, knowledge_base_id,
-                 guardrail_id, guardrail_version, bedrock_model_id, embedding_model_id,
-                 chroma_host, chroma_port
-- clients.py  — make_comprehend(), make_bedrock_agent_runtime(), make_bedrock_runtime(),
-                 make_cloudwatch() — all boto3 clients constructed here, nowhere else
-- adapters.py — ComprehendAdapter: wraps Comprehend, falls back to "english" on LocalStack
-                 LocalRAGAdapter: mimics Bedrock KB retrieve_and_generate locally via
-                   ChromaDB + Titan embed + Claude InvokeModel. Selects backend at init:
-                   - CHROMA_HOST set → _ChromaHttpClient (stdlib urllib, no chromadb package)
-                   - CHROMA_HOST empty → chromadb.PersistentClient (in-process)
-                 BedrockRAGAdapter: wraps bedrock-agent-runtime retrieve_and_generate
-
-Adding a new AWS service: add make_X() to clients.py, add XAdapter if LocalStack
-limitations apply, inject into lambda_handler — no changes to business logic files.
+`corpus ∈ {"statute", "faq"}` and `chunkType ∈ {"body", "toc"}` are
+filterable; `chapter` / `title` / `pageImageKey` /
+`AMAZON_BEDROCK_TEXT` / `AMAZON_BEDROCK_METADATA` are non-filterable
+to stay under the 2048-byte S3 Vectors filterable-metadata cap.
 
 ## Local testing strategy
 
-### Two local paths — choose based on what you're testing
+### Paths
+- **`make dev`** — LocalStack + ChromaDB + backend in-process
+  (`python -m app.server_local`, port 8080) + Vite dev server.
+  Real AWS creds for Bedrock; everything else against LocalStack.
+- **LocalStack Lambda** — for infra/wiring verification only;
+  Bedrock calls fail inside the Lambda container by design.
 
-**Path A — server_local.py (recommended for frontend dev + RAG quality)**
-- Runs handler in-process on the host machine with real AWS credentials
-- ChromaDB PersistentClient reads .local-vectorstore/ directly (no HTTP server needed)
-- Port 8080; set LOCAL_API_URL=http://localhost:8080 in frontend/.env.local
-- Start: `cd backend && ENV=local uv run server_local.py`
-- Full stack: Terminal 1 above, Terminal 2: `cd frontend && npm run dev`
-- Verified working: 5 citations returned from Employment Act on real questions
+### Commands
+- `make test` — `unittest discover -s tests -p 'test_unit.py'` (backend)
+  + `tsc --noEmit` (frontend) + `npm test` (pipeline crawler).
+- `make eval` — `uv run -m evals.run` against the golden set.
+- `make ingest-local` — hydrate `.local-vectorstore/` from LocalStack S3.
 
-**Path B — LocalStack Lambda (for infrastructure/wiring verification)**
-- Lambda runs inside Docker with fake credentials (LocalStack injects test/test)
-- CHROMA_HOST=host.docker.internal lets container reach ChromaDB HTTP server on host
-- ChromaDB must be running: `uv run chroma run --path .local-vectorstore --port 8000 --host 0.0.0.0`
-- Bedrock InvokeModel fails inside Lambda because LocalStack overrides credentials —
-  use Path A for real RAG responses
-- Invoke via: `make local-apply` then invoke Lambda through LocalStack API Gateway
-
-### Local infrastructure
-- LocalStack Pro (paid): Lambda, API Gateway, S3, CloudWatch, IAM
-  - Start: localstack start -d (no docker-compose — not set up)
-  - Comprehend DetectDominantLanguage not yet implemented in LocalStack Pro
-    v2026.3.x — ComprehendAdapter falls back to "english" locally
-- Bedrock always hits real AWS (LocalStack does not support it)
-- Local vector store at backend/.local-vectorstore/ (gitignored, excluded from Lambda zip)
-  - Populated once: ENV=local uv run ingest_local.py (reads from LocalStack S3)
-  - 1196 chunks embedded and verified
-- ENV=local switches boto3 clients to LocalStack endpoint
-- LOCALSTACK_HOSTNAME env var (injected by LocalStack into Lambda) resolves
-  the correct internal Docker hostname; falls back to localhost for direct calls
-- Pipeline uses AWS_ENDPOINT_URL=http://localhost:4566 for LocalStack S3;
-  Bedrock endpoint explicitly hardcoded in llm-extract.ts to bypass it
-- uv manages Python dependencies (Python 3.12)
-
-### Test scripts (all committed to git, excluded from Lambda zip)
-- `uv run test_unit.py`        — 60 unit tests, no AWS required, runs in 0.01s
-- `ENV=local uv run test_e2e_local.py` — in-process end-to-end RAG (real Bedrock)
-- `ENV=local uv run test_language_detection.py` — language detection against LocalStack
-
-## CloudWatch custom metrics (namespace: HakiAI)
-- SuccessfulRequests, FailedRequests
-- ResponseLatency (ms)
-- DetectedLanguage_english / _swahili / _mixed
-- GuardrailBlock, MissingCitations, LowConfidenceRetrieval
-
-## CloudWatch alarms → SNS email alerts
-- Error rate > 5%
-- p95 latency > 5000ms
-- GuardrailBlocks > 20/hr
+## CloudWatch metrics (namespace: HakiAI)
+- Request/response: `SuccessfulRequests`, `FailedRequests`,
+  `ResponseLatency`.
+- Language: `DetectedLanguage_english` / `_swahili` / `_mixed`.
+- Quality: `GuardrailBlock`, `MissingCitations`,
+  `LowConfidenceRetrieval`, `EvalScore`.
 
 ## Terraform state
-- Remote backend: S3 bucket haki-ai-terraform-state (must exist before `terraform init`).
-- Environments are isolated via Terraform workspaces on the same backend:
-  - `default` workspace → key `terraform.tfstate` → prod (real AWS)
-  - `local`   workspace → key `env:/local/terraform.tfstate` → LocalStack
-- Flip between them with `terraform workspace select local|default` — no reinit.
-- Makefile targets do the select automatically:
-  - `make local-apply` / `make local-destroy` / `make local-output`
-  - `make apply` / `make destroy` / `make output` (prod)
-- Prod apply requires `TF_VAR_langsmith_api_key` (else tracing is disabled cleanly).
-
-## Frontend hosting (prod)
-- S3 bucket `haki-ai-web` (private, blocked-public) + CloudFront distribution.
-- CloudFront Origin Access Control (OAC, SigV4) — bucket only accepts
-  requests from this distribution. No public-read bucket policy.
-- Price class `PriceClass_100` (US + Canada + Europe edges only). Flip
-  `cloudfront_price_class` in terraform.tfvars to widen coverage.
-- SPA rewrite: S3 403/404 → `/index.html` with 200 so React Router can
-  handle any path client-side.
-- Cache headers: hashed assets (`/assets/*`) are `max-age=31536000,
-  immutable`; `*.html` is `max-age=0, must-revalidate`. Set by
-  `make deploy-web` on the `aws s3 sync` calls.
-- Default domain only (`*.cloudfront.net`) — custom domain + ACM cert
-  is a future add-on.
-
-### Deploy
-```
-cd infra && make deploy-web    # npm ci + vite build + s3 sync + invalidation
-```
-The target reads the distribution id and bucket name from terraform
-outputs, so a fresh prod apply plus `make deploy-web` puts a new build
-live in roughly 1 minute (build) + a couple of minutes for cache
-invalidation to complete at every edge.
-
-## Frontend (frontend/)
-- React + Vite + Tailwind v4 (@tailwindcss/vite plugin)
-- Custom color tokens defined in index.css via @theme block:
-  --color-bg, --color-elevated, --color-border, --color-muted,
-  --color-accent, --color-accent-bright, --color-citation, --color-strong, etc.
-- Components: ChatApp, MessageThread, Composer, LanguageBadge,
-  CitationBlock, PageCarousel
-- PageCarousel: displays single-page PDFs from page-images/ S3 prefix
-  as a citation carousel (useState, no extra deps)
-- API modes (chatClient.ts):
-  - VITE_USE_MOCK=true or VITE_API_BASE_URL unset → mock mode (no backend)
-  - VITE_API_BASE_URL="" (empty) + LOCAL_API_URL set → real API via Vite proxy
-  - VITE_API_BASE_URL="https://..." → real API called directly (production)
-- Local dev: set LOCAL_API_URL=http://localhost:8080 in frontend/.env.local
+- Remote backend: S3 bucket `haki-ai-terraform-state`.
+- Workspaces: `default` → prod, `local` → LocalStack. Flip with
+  `terraform workspace select`.
+- Prod apply needs `TF_VAR_langsmith_api_key` in the environment
+  (CI reads it from GitHub Secrets).
 
 ## Current status
-
-### Done
-- Pipeline (both scripts) complete, tested, and verified locally against LocalStack
-  - 1196 chunks + metadata sidecars across all 3 laws
-  - Resume-safe: S3 cache for Haiku extractions, .complete markers, local temp dir
-- Pipeline refactored: dead code removed, module-level doc comments added
-- Backend fully implemented — all 6 handler steps wired:
-  - prompts.py: build_system_prompt(language) — english / swahili / mixed variants
-  - rag.py: retrieve_and_generate() + check_guardrail_block() — env-agnostic
-  - citations.py: extract_citations() — deduplicates by chunkId, includes pageImageKey
-  - metrics.py: emit_metrics() → HakiAI CloudWatch namespace
-  - handler.py: thin orchestrator, all steps wired, CORS headers
-- Backend architecture: config / clients / adapters / handler separation
-- Local RAG adapter implemented: ChromaDB + Titan Embed Text v2 + Claude InvokeModel
-  - LocalRAGAdapter uses _ChromaHttpClient (stdlib urllib) when CHROMA_HOST is set
-  - Falls back to chromadb.PersistentClient when CHROMA_HOST is empty (in-process)
-  - Returns Bedrock KB-compatible response shape; citations.py/handler.py env-agnostic
-  - 1196 chunks ingested and verified; end-to-end RAG verified (5 citations on test query)
-- server_local.py: in-process HTTP server on port 8080 for frontend local dev
-  - No LocalStack required; runs with real AWS credentials on host
-  - Verified: real RAG responses with citations returned to frontend
-- infra/modules/compute: Lambda (Python 3.12) + IAM role + policy
-  - CHROMA_HOST=host.docker.internal + CHROMA_PORT=8000 in Lambda env vars
-  - archive_file zips backend/ excluding .venv, test_*.py, *_local.py, uv files
-- infra/modules/api: API Gateway HTTP + CORS + Lambda integration + access logs
-- infra/modules/observability: CloudWatch alarms + dashboard + SNS email alerts
-  - 4 alarms: error rate, p95 latency (extended_statistic), guardrail blocks, lambda errors
-- Frontend Vite proxy: LOCAL_API_URL (Node-only) proxies /chat to backend
-- Unit tests: 35 tests covering all business logic modules, run in 0.001s
-- End-to-end verified locally: frontend → server_local.py → ChromaDB → Bedrock → citations
-
-### Remaining — prod deployment
-- make apply → create prod infra on real AWS
-- npm run dev + npm run chunk → pipeline against real S3
-- start_ingestion_job → index chunks into Bedrock KB
-- Connect frontend: set VITE_API_BASE_URL to API Gateway URL
+Phase 1–6 of the rubric-alignment plan are complete: advanced RAG,
+two-tier multi-agent, eval harness, SheriaPlex corpus + SageMaker
+fine-tune scaffolding, Swahili UI, clone-and-run Makefile, auto
+ingestion, three GitHub Actions workflows, backend refactor, and
+per-package diagram-led docs. Remaining work is prod rollout and any
+final demo polish.
