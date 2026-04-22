@@ -20,8 +20,8 @@ terraform {
 }
 
 locals {
-  is_local        = var.environment == "local"
-  localstack_url  = "http://localhost:4566"
+  is_local       = var.environment == "local"
+  localstack_url = "http://localhost:4566"
 }
 
 provider "aws" {
@@ -47,6 +47,7 @@ provider "aws" {
       cloudwatchlogs = local.localstack_url
       sns            = local.localstack_url
       sts            = local.localstack_url
+      dynamodb       = local.localstack_url
     }
   }
 }
@@ -80,16 +81,18 @@ module "ai" {
 # ── Compute: Lambda ───────────────────────────────────────────────────────────
 
 module "compute" {
-  source            = "./modules/compute"
-  project_name      = var.project_name
-  aws_region        = var.aws_region
-  environment       = var.environment
-  knowledge_base_id = local.is_local ? "" : module.ai[0].knowledge_base_id
-  guardrail_id      = local.is_local ? "" : module.ai[0].guardrail_id
-  guardrail_version = local.is_local ? "DRAFT" : module.ai[0].guardrail_version
-  bedrock_model_id  = var.bedrock_model_id
-  chroma_host       = var.chroma_host
-  chroma_port       = var.chroma_port
+  source                 = "./modules/compute"
+  project_name           = var.project_name
+  aws_region             = var.aws_region
+  environment            = var.environment
+  knowledge_base_id      = local.is_local ? "" : module.ai[0].knowledge_base_id
+  guardrail_id           = local.is_local ? "" : module.ai[0].guardrail_id
+  guardrail_version      = local.is_local ? "DRAFT" : module.ai[0].guardrail_version
+  bedrock_model_id       = var.bedrock_model_id
+  chroma_host            = var.chroma_host
+  chroma_port            = var.chroma_port
+  checkpoints_table_name = module.storage.checkpoints_table_name
+  checkpoints_table_arn  = module.storage.checkpoints_table_arn
 }
 
 # ── API: API Gateway HTTP ─────────────────────────────────────────────────────

@@ -114,7 +114,7 @@ resource "aws_bedrock_guardrail" "this" {
     topics_config {
       name       = "off-topic"
       definition = "Any question not related to Kenyan law, the Constitution of Kenya, employment law, or land law."
-      examples   = [
+      examples = [
         "What is the weather today?",
         "Tell me a joke",
         "Who won the election?",

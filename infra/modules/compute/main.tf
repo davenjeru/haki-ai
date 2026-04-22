@@ -53,6 +53,19 @@ resource "aws_iam_role_policy" "lambda_policy" {
         ]
         Resource = "*"
       },
+      # DynamoDB — LangGraph checkpoint store (conversation memory).
+      # Scoped strictly to the checkpoints table so the Lambda cannot touch
+      # anything else in DynamoDB.
+      {
+        Effect = "Allow"
+        Action = [
+          "dynamodb:GetItem",
+          "dynamodb:PutItem",
+          "dynamodb:Query",
+          "dynamodb:BatchWriteItem",
+        ]
+        Resource = var.checkpoints_table_arn
+      },
     ]
   })
 }
@@ -70,8 +83,8 @@ data "archive_file" "lambda_zip" {
     ".venv",
     "__pycache__",
     "*.pyc",
-    "test_*.py",   # test runners — committed to git, not needed in Lambda
-    "*_local.py",  # local-only scripts — committed to git, not needed in Lambda
+    "test_*.py",  # test runners — committed to git, not needed in Lambda
+    "*_local.py", # local-only scripts — committed to git, not needed in Lambda
     "pyproject.toml",
     "uv.lock",
   ]
@@ -100,6 +113,7 @@ resource "aws_lambda_function" "handler" {
       BEDROCK_MODEL_ID  = var.bedrock_model_id
       CHROMA_HOST       = var.chroma_host
       CHROMA_PORT       = var.chroma_port
+      CHECKPOINTS_TABLE = var.checkpoints_table_name
     }
   }
 }

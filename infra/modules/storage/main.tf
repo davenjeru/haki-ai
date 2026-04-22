@@ -69,3 +69,39 @@ resource "aws_s3vectors_index" "kb" {
   dimension          = 1024
   distance_metric    = "cosine"
 }
+
+# ── LangGraph checkpoint store (DynamoDB) ─────────────────────────────────────
+# Single-table design keyed by (thread_id, sort_key). thread_id equals the
+# frontend-generated sessionId so conversation memory survives Lambda cold
+# starts and server_local.py restarts. TTL attribute auto-purges abandoned
+# conversations after ~30 days (set by backend/checkpointer.py).
+
+resource "aws_dynamodb_table" "checkpoints" {
+  name         = "${var.project_name}-checkpoints"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "thread_id"
+  range_key    = "sort_key"
+
+  attribute {
+    name = "thread_id"
+    type = "S"
+  }
+
+  attribute {
+    name = "sort_key"
+    type = "S"
+  }
+
+  ttl {
+    attribute_name = "expires_at"
+    enabled        = true
+  }
+
+  # PITR is free-tier-unfriendly on LocalStack; skip it locally.
+  dynamic "point_in_time_recovery" {
+    for_each = var.is_local ? [] : [1]
+    content {
+      enabled = true
+    }
+  }
+}
