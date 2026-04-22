@@ -32,6 +32,10 @@ export interface PageExtraction {
   pageNum: number;
   chapterOrPart: string | null; // null if no new chapter/part starts on this page
   sections: SectionHit[];       // empty if page is pure body text
+  // True if this page is a table of contents / arrangement-of-sections listing
+  // rather than substantive legal text. Pages flagged here propagate a
+  // `chunkType: "toc"` metadata attribute so retrieval can filter them out.
+  isToc?: boolean;
 }
 
 // ── S3 extraction cache ───────────────────────────────────────────────────────
@@ -102,13 +106,16 @@ Identify the following from the page text above:
    - "title": the title text that follows the number on the same line (strip trailing periods)
    - "bodyStartLine": the 0-indexed line number of the FIRST line of body text for this section (i.e. the line AFTER the heading line)
 
+3. TABLE OF CONTENTS FLAG: Set "isToc" to true if this page is a table of contents / arrangement of sections / arrangement of articles (a listing of section numbers and titles with no substantive body text — typically a few pages at the start of each Act or Chapter). Otherwise omit the field or set it to false.
+
 Return ONLY valid JSON matching this exact schema — no markdown fences, no explanation:
 
 {
   "chapterOrPart": "<string or null>",
   "sections": [
     { "number": "<string>", "title": "<string>", "bodyStartLine": <integer> }
-  ]
+  ],
+  "isToc": <boolean, optional>
 }
 
 Rules:
@@ -154,6 +161,7 @@ function parseHaikuResponse(rawText: string, pageNum: number): PageExtraction {
   const obj = parsed as Record<string, unknown>;
   const chapterOrPart =
     typeof obj.chapterOrPart === "string" ? obj.chapterOrPart : null;
+  const isToc = typeof obj.isToc === "boolean" ? obj.isToc : false;
 
   const sections: SectionHit[] = [];
   if (Array.isArray(obj.sections)) {
@@ -179,7 +187,7 @@ function parseHaikuResponse(rawText: string, pageNum: number): PageExtraction {
     }
   }
 
-  return { pageNum, chapterOrPart, sections };
+  return { pageNum, chapterOrPart, sections, isToc };
 }
 
 // ── Retry helpers ─────────────────────────────────────────────────────────────
@@ -250,7 +258,7 @@ export async function extractPageStructure(
         console.warn(
           `\n  [page ${pageNum}] Haiku failed after ${MAX_RETRIES + 1} attempts, using empty extraction. Error: ${String(err)}`
         );
-        return { pageNum, chapterOrPart: null, sections: [] };
+        return { pageNum, chapterOrPart: null, sections: [], isToc: false };
       }
 
       const throttling = isThrottling(err);
@@ -264,5 +272,5 @@ export async function extractPageStructure(
     }
   }
 
-  return { pageNum, chapterOrPart: null, sections: [] };
+  return { pageNum, chapterOrPart: null, sections: [], isToc: false };
 }

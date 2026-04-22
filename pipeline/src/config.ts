@@ -8,6 +8,11 @@ export const RAW_PREFIX = "raw-laws/";
 export const CHUNKS_PREFIX = "processed-chunks/";
 export const PAGE_IMAGES_PREFIX = "page-images/";
 export const PAGE_TEXT_PREFIX = "page-text/";
+// Phase 4a — FAQ corpus (SheriaPlex Q&A + KenyaLaw case summaries).
+// Lives under the same bucket as statute chunks but under a distinct prefix
+// so the Bedrock KB data source can ingest both side-by-side; retrieval is
+// separated by the corpus=faq metadata attribute.
+export const FAQ_CHUNKS_PREFIX = "faq-chunks/";
 
 // ~500 tokens at ~4 chars/token
 export const CHUNK_CHAR_LIMIT = 2000;

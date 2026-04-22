@@ -10,6 +10,10 @@
     "dev:local": "AWS_ENDPOINT_URL=http://localhost:4566 tsx src/run.ts",
     "chunk": "tsx src/chunk-laws.ts",
     "chunk:local": "AWS_ENDPOINT_URL=http://localhost:4566 tsx src/chunk-laws.ts",
+    "crawl": "tsx src/crawl-sheriaplex.ts",
+    "crawl:dry": "tsx src/crawl-sheriaplex.ts -- --dry-run",
+    "test": "tsx src/crawl-sheriaplex.test.ts",
+    "typecheck": "tsc --noEmit",
     "local:start": "localstack start -d",
     "local:stop": "localstack stop"
   },
@@ -17,6 +21,7 @@
     "@aws-sdk/client-bedrock-runtime": "^3.1032.0",
     "@aws-sdk/client-s3": "^3.0.0",
     "@llamaindex/liteparse": "latest",
+    "cheerio": "^1.0.0",
     "pdf-lib": "^1.17.1"
   },
   "devDependencies": {

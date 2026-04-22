@@ -28,6 +28,20 @@ interface SectionNode {
   title: string;
   lines: string[];
   startPage: number;
+  // Marked true whenever any page contributing lines to this node was
+  // flagged as a table-of-contents page by the Haiku extractor, OR when
+  // the section title itself matches a TOC heuristic ("Arrangement of
+  // Sections", "Table of Contents"). Propagated to Chunk.chunkType.
+  isToc: boolean;
+}
+
+// Matches "Arrangement of Sections" / "Arrangement of Articles" / "Table of
+// Contents" (case-insensitive). Used as a structural fallback when Haiku
+// misses an obvious TOC page (e.g. when the page text contains real section
+// numbers that look like body text to the model).
+function hasTocHeading(text: string | null | undefined): boolean {
+  if (!text) return false;
+  return /arrangement of (sections|articles)|table of contents/i.test(text);
 }
 
 function formatSectionLabel(
@@ -67,7 +81,7 @@ export function assembleChunks(
   };
 
   for (const extraction of sorted) {
-    const { pageNum, chapterOrPart, sections } = extraction;
+    const { pageNum, chapterOrPart, sections, isToc } = extraction;
     const rawLines = (pageTexts.get(pageNum) ?? "")
       .split("\n")
       .filter((line) => !isNoise(line));
@@ -76,6 +90,8 @@ export function assembleChunks(
     if (chapterOrPart) {
       currentChapter = normalizeGroupLabel(chapterOrPart, law.structure);
     }
+
+    const pageIsToc = isToc === true || hasTocHeading(chapterOrPart);
 
     if (sections.length === 0) {
       // Entire page is body text for the current section
@@ -87,9 +103,11 @@ export function assembleChunks(
           title: "",
           lines: [...rawLines],
           startPage: pageNum,
+          isToc: pageIsToc,
         };
       } else {
         currentNode.lines.push(...rawLines);
+        if (pageIsToc) currentNode.isToc = true;
       }
       continue;
     }
@@ -106,6 +124,7 @@ export function assembleChunks(
 
       if (currentNode !== null) {
         currentNode.lines.push(...linesBeforeHeader);
+        if (pageIsToc) currentNode.isToc = true;
       }
 
       flush();
@@ -116,6 +135,7 @@ export function assembleChunks(
         title: hit.title,
         lines: rawLines.slice(hit.bodyStartLine),
         startPage: pageNum,
+        isToc: pageIsToc || hasTocHeading(hit.title),
       };
 
       lastBodyEnd = hit.bodyStartLine;
@@ -148,6 +168,7 @@ export function assembleChunks(
         text,
         startPage: node.startPage,
         pageImageKey: `page-images/${law.shortId}/page-${node.startPage}.pdf`,
+        chunkType: node.isToc ? "toc" : "body",
       });
     });
   }

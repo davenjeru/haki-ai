@@ -10,6 +10,18 @@ export interface Chunk {
   text: string;          // body text for this chunk
   startPage: number;     // PDF page where this section header appears
   pageImageKey?: string; // S3 key for the page PDF, used in the citation carousel
+  // "toc" for table-of-contents / arrangement-of-sections listings, "body"
+  // for substantive legal text. The advanced-RAG retriever filters out
+  // chunks whose chunkType === "toc" because they would otherwise poison
+  // top-k results with indexes that list section titles verbatim.
+  chunkType: "body" | "toc";
+  // "statute" for chunks derived from Act/Constitution PDFs (default), "faq"
+  // for crawled Q&A content (SheriaPlex, KenyaLaw summaries). Bedrock KB uses
+  // this to route queries: the FAQAgent filters on corpus="faq" while the
+  // statute specialists filter on source=<Act name> (corpus=statute implied).
+  corpus?: "statute" | "faq";
+  category?: string;     // FAQ-only: SheriaPlex category (e.g. "Employment")
+  url?: string;          // FAQ-only: original Q&A URL for attribution
 }
 
 // ── Noise filtering ───────────────────────────────────────────────────────────

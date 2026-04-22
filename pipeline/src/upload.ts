@@ -93,6 +93,16 @@ export async function uploadChunks(
     maybePut("title", chunk.title);
     maybePut("chunkId", chunk.chunkId);
     maybePut("pageImageKey", chunk.pageImageKey);
+    maybePut("category", chunk.category);
+    maybePut("url", chunk.url);
+    // chunkType is always "body" or "toc" — never empty, so we set it
+    // directly rather than via maybePut. Filtering in advanced RAG excludes
+    // chunkType="toc" before the reranker sees it.
+    metadataAttributes["chunkType"] = chunk.chunkType ?? "body";
+    // corpus defaults to "statute" so existing Act/Constitution chunks keep
+    // their current behaviour; Phase 4a SheriaPlex + KenyaLaw crawls set it
+    // to "faq" and the FAQAgent filters accordingly.
+    metadataAttributes["corpus"] = chunk.corpus ?? "statute";
 
     await s3.send(new PutObjectCommand({
       Bucket: S3_BUCKET,
