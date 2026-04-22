@@ -52,3 +52,23 @@ variable "langsmith_endpoint" {
   type        = string
   default     = "https://api.smith.langchain.com"
 }
+
+# ── Auto-ingestion trigger (Phase 5b) ────────────────────────────────────────
+
+variable "data_bucket_name" {
+  description = "Name (not ARN) of the data bucket. Used to scope the EventBridge rule that fires ingestion jobs on S3 uploads."
+  type        = string
+  default     = ""
+}
+
+variable "ingestion_kb_id" {
+  description = "Knowledge Base id to run ingestion against. Empty disables the auto-ingestion trigger (e.g. local runs)."
+  type        = string
+  default     = ""
+}
+
+variable "ingestion_data_source_id" {
+  description = "Bedrock KB data-source id. Empty disables the auto-ingestion trigger."
+  type        = string
+  default     = ""
+}

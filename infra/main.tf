@@ -115,6 +115,9 @@ module "compute" {
   checkpoints_table_name       = module.storage.checkpoints_table_name
   checkpoints_table_arn        = module.storage.checkpoints_table_arn
   data_bucket_arn              = module.storage.data_bucket_arn
+  data_bucket_name             = module.storage.data_bucket_id
+  ingestion_kb_id              = local.is_local ? "" : module.ai[0].knowledge_base_id
+  ingestion_data_source_id     = local.is_local ? "" : module.ai[0].data_source_id
   langsmith_ssm_parameter_name = local.langsmith_ssm_parameter_name
   langsmith_ssm_parameter_arn  = local.langsmith_ssm_parameter_arn
   langsmith_project            = var.langsmith_project
