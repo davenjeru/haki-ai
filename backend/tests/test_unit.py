@@ -186,18 +186,36 @@ class TestBuildChatSystemPrompt(unittest.TestCase):
     def test_chat_prompt_forbids_freelance_refusal_prefix(self):
         # Locks in the fix for the prod bug where the chat node emitted the
         # bilingual refusal as a prefix and then kept talking (e.g. suggesting
-        # the Immigration office). The prompt must instruct the model to
-        # return the refusal verbatim with no prefix/suffix.
+        # the user go to a specific government office). The prompt must
+        # instruct the model to return the refusal verbatim with no
+        # prefix/suffix — as a general rule, not a topic-specific patch.
         prompt = build_chat_system_prompt("english")
         self.assertIn("ENTIRE reply must be", prompt)
         self.assertIn("no prefix, suffix, or follow-up", prompt)
 
-    def test_chat_prompt_mentions_citizenship_is_in_scope(self):
-        # Prevents the chat agent from refusing citizenship questions as
-        # out-of-scope. (Routing should not send them here in the first
-        # place, but the prompt should be coherent if something slips.)
-        prompt = build_chat_system_prompt("english")
-        self.assertIn("citizenship", prompt.lower())
+    def test_chat_prompt_is_topic_agnostic(self):
+        # Scope-enforcement belongs to the guardrail + routing layer, not to
+        # an ever-growing allowlist inside the chat prompt. If a specific bug
+        # tempts us to name a topic here (e.g. "citizenship is in scope",
+        # "don't suggest the Immigration office"), that is a sign the fix
+        # belongs upstream (supervisor routing + golden set coverage), not
+        # in the prompt. These assertions fail loudly if such overfits leak
+        # back in.
+        prompt = build_chat_system_prompt("english").lower()
+        forbidden_phrases = [
+            "citizenship",
+            "chapter 3",
+            "immigration office",
+            "contact information",
+            "government offices",
+        ]
+        for phrase in forbidden_phrases:
+            with self.subTest(phrase=phrase):
+                self.assertNotIn(
+                    phrase,
+                    prompt,
+                    f"chat prompt leaked topic-specific phrase: {phrase!r}",
+                )
 
 
 # ── check_guardrail_block ─────────────────────────────────────────────────────
@@ -1193,26 +1211,52 @@ class TestSupervisorParsing(unittest.TestCase):
 
 class TestSupervisorPromptContent(unittest.TestCase):
     """
-    Regression tests for prod bugs uncovered via LangSmith tracing:
-      1. "how can i get kenyan citezenship" routed to chat because the
-         prompt didn't mention citizenship explicitly.
-      2. Short follow-up questions after chit-chat got misclassified
-         because the prompt didn't tell the model to focus on the
-         latest message, not conversation history.
+    The supervisor prompt must describe agents generically (one statute
+    each) and enforce a few GENERAL routing rules. Topic-specific hints
+    ("citizenship is in scope", "how to apply for citizenship") are
+    overfits to a single bug and create maintenance debt — regression
+    coverage for those bugs belongs in the golden set, not the prompt.
     """
 
-    def test_mentions_citizenship_under_constitution(self):
-        self.assertIn("CITIZENSHIP", SUPERVISOR_PROMPT)
-        self.assertIn("Chapter 3", SUPERVISOR_PROMPT)
-
     def test_explicitly_warns_against_history_bias(self):
+        # Fixes the prod bug where prior chit-chat biased routing toward
+        # "chat" even when the newest message was clearly a legal question.
+        # This is a GENERAL rule (not topic-specific) and should stay.
         self.assertIn("LATEST user message", SUPERVISOR_PROMPT)
         self.assertIn("MUST NOT bias", SUPERVISOR_PROMPT)
 
-    def test_has_citizenship_routing_example(self):
-        # At least one example routing citizenship to constitution.
-        self.assertIn("kenyan citizenship", SUPERVISOR_PROMPT.lower())
-        self.assertIn("constitution", SUPERVISOR_PROMPT.lower())
+    def test_describes_each_specialist_by_its_primary_statute(self):
+        # Agents are defined by the primary source they cover, not by an
+        # enumerated list of sub-topics. This keeps the prompt stable as
+        # we add more statutes or edge cases.
+        self.assertIn("Constitution of Kenya 2010", SUPERVISOR_PROMPT)
+        self.assertIn("Employment Act 2007", SUPERVISOR_PROMPT)
+        self.assertIn("Land Act 2012", SUPERVISOR_PROMPT)
+
+    def test_is_free_of_topic_specific_overfits(self):
+        # If a prod bug tempts us to patch a specific topic into the prompt
+        # (e.g. "CITIZENSHIP (Chapter 3)"), the structural fix is: broaden
+        # the agent description, improve retrieval, and add a regression
+        # row to the golden set. These assertions lock that discipline in.
+        lowered = SUPERVISOR_PROMPT.lower()
+        forbidden_phrases = [
+            "citizenship",
+            "chapter 3",
+            "dual citizenship",
+            "by birth",
+            "by registration",
+            "how to apply for citizenship",
+            "is in scope",
+            "out-of-scope",
+            "never refuse",
+        ]
+        for phrase in forbidden_phrases:
+            with self.subTest(phrase=phrase):
+                self.assertNotIn(
+                    phrase,
+                    lowered,
+                    f"supervisor prompt leaked topic-specific phrase: {phrase!r}",
+                )
 
 
 class TestRouteSupervisor(unittest.TestCase):
@@ -1323,13 +1367,56 @@ class TestGoldenSet(unittest.TestCase):
     def test_has_at_least_thirty_cases(self):
         self.assertGreaterEqual(len(self.cases), 30)
 
-    def test_has_at_least_ten_per_category(self):
+    def test_has_at_least_ten_per_statute_category(self):
         counts: dict[str, int] = {}
         for c in self.cases:
             counts[c.category] = counts.get(c.category, 0) + 1
         self.assertGreaterEqual(counts.get("constitution", 0), 10)
         self.assertGreaterEqual(counts.get("employment", 0), 10)
         self.assertGreaterEqual(counts.get("land", 0), 10)
+
+    def test_has_off_topic_refusal_cases(self):
+        # Off-topic refusal coverage is what lets us keep the prompts
+        # topic-agnostic: the eval catches "half-refusal" freelancing
+        # bugs without us having to patch each one into the prompt.
+        refusals = [c for c in self.cases if c.category == "refusal"]
+        self.assertGreaterEqual(
+            len(refusals),
+            3,
+            "Need at least 3 off-topic refusal cases (weather / other-jurisdiction / medical)",
+        )
+
+    def test_refusal_cases_reference_the_bilingual_refusal(self):
+        for c in (c for c in self.cases if c.category == "refusal"):
+            with self.subTest(case=c.id):
+                self.assertEqual(
+                    c.reference_answer.strip(),
+                    BILINGUAL_REFUSAL,
+                    f"{c.id}: refusal gold-answer must match BILINGUAL_REFUSAL verbatim",
+                )
+
+    def test_constitution_breadth_beyond_citizenship(self):
+        # Stress-tests the generic supervisor description by making sure the
+        # constitution category covers a wide span of articles — not just
+        # the one topic that happened to trigger a prod bug. If the prompt
+        # starts overfitting again, these non-citizenship cases will flag
+        # any routing/retrieval regression that was being masked.
+        articles_touched: set[str] = set()
+        for c in self.cases:
+            if c.category != "constitution":
+                continue
+            for section in c.expected_sections:
+                articles_touched.add(section)
+        # At least five DIFFERENT articles across chapters other than 3.
+        non_citizenship = {
+            a for a in articles_touched
+            if a not in {"Article 14", "Article 15", "Article 16"}
+        }
+        self.assertGreaterEqual(
+            len(non_citizenship),
+            5,
+            f"only {len(non_citizenship)} non-citizenship articles: {non_citizenship}",
+        )
 
     def test_has_at_least_ten_non_english_cases(self):
         non_english = [c for c in self.cases if c.language != "english"]
@@ -1339,9 +1426,14 @@ class TestGoldenSet(unittest.TestCase):
         ids = [c.id for c in self.cases]
         self.assertEqual(len(ids), len(set(ids)))
 
-    def test_every_case_has_an_expected_source(self):
+    def test_every_statute_case_has_an_expected_source(self):
+        # Refusal cases intentionally have empty expected_sources — the
+        # gold answer IS the bilingual refusal, no statute applies.
         for c in self.cases:
-            self.assertGreater(len(c.expected_sources), 0, c.id)
+            if c.category == "refusal":
+                continue
+            with self.subTest(case=c.id):
+                self.assertGreater(len(c.expected_sources), 0, c.id)
 
 
 # ── Evals: judge response parsing ─────────────────────────────────────────────
