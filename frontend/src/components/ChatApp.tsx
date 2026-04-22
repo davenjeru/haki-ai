@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { sendChatMessage } from '../api/chatClient'
+import { fetchChatHistory, getSessionId, sendChatMessage } from '../api/chatClient'
 import { placeholderForLanguage } from '../lib/placeholders'
 import type { ChatMessage, Citation, DetectedLanguage } from '../types/chat'
 import { Composer } from './Composer'
@@ -22,6 +22,7 @@ export function ChatApp() {
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [draft, setDraft] = useState('')
   const [loading, setLoading] = useState(false)
+  const [hydrating, setHydrating] = useState(true)
   const [hintLang, setHintLang] = useState<DetectedLanguage | undefined>(undefined)
   const [activeSource, setActiveSource] = useState<ActiveSource | null>(null)
   const bottomRef = useRef<HTMLDivElement>(null)
@@ -33,6 +34,32 @@ export function ChatApp() {
     const msg = messages.find((m) => m.id === activeSource.messageId)
     return msg?.citations ?? []
   }, [messages, activeSource])
+
+  // Restore the persisted conversation on mount. The sessionId lives in
+  // localStorage (chatClient.ts), so a refresh picks up exactly where the
+  // user left off — including freshly re-presigned citation URLs.
+  useEffect(() => {
+    let cancelled = false
+    const sid = getSessionId()
+    fetchChatHistory(sid)
+      .then((restored) => {
+        if (cancelled || restored.length === 0) return
+        setMessages(restored)
+        const lastAssistant = [...restored].reverse().find((m) => m.role === 'assistant')
+        if (lastAssistant?.language) setHintLang(lastAssistant.language)
+        if (lastAssistant?.citations && lastAssistant.citations.length > 0) {
+          const firstWithPage = lastAssistant.citations.findIndex((c) => Boolean(c.pageImageUrl))
+          setActiveSource({
+            messageId: lastAssistant.id,
+            index: firstWithPage === -1 ? 0 : firstWithPage,
+          })
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setHydrating(false)
+      })
+    return () => { cancelled = true }
+  }, [])
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -112,7 +139,7 @@ export function ChatApp() {
       <div className="flex-1 flex gap-6 min-h-0">
         <section className="flex-1 flex flex-col min-w-0 max-w-[760px] mx-auto lg:mx-0">
           <main className="flex-1 overflow-y-auto pb-2">
-            {messages.length === 0 && !loading && (
+            {messages.length === 0 && !loading && !hydrating && (
               <p className="mb-4 p-[1rem_1.1rem] bg-elevated border border-border rounded-[12px] text-muted text-[0.95rem]">
                 Ask a question about Kenyan law. The assistant replies in English or Swahili and cites the relevant provisions.
               </p>

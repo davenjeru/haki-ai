@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from adapters import ComprehendAdapter
 from chat_node import invoke_chat
 from checkpointer import DynamoDBSaver
-from citations import extract_citations
+from citations import extract_citations, refresh_presigned_urls
 from classifier import classify_intent, _parse_needs_rag
 from graph import _detect_language
 from handler import lambda_handler
@@ -230,6 +230,20 @@ class TestExtractCitations(unittest.TestCase):
         )
         self.assertIn("pageImageUrl", result[0])
 
+    def test_page_image_key_is_persisted_alongside_url(self):
+        # The key must be stored so history hydration can re-presign later.
+        class _FakeS3:
+            def generate_presigned_url(self, op, Params, ExpiresIn):
+                return "https://example.test/signed"
+
+        result = extract_citations(
+            self._rag_result([self._ref("chunk-1")]),
+            s3_client=_FakeS3(),
+            bucket="haki-ai-data",
+        )
+        self.assertEqual(result[0]["pageImageKey"], "page-images/employment-act-2007/page-45.pdf")
+
+
     def test_page_image_url_absent_when_no_s3_client(self):
         result = extract_citations(self._rag_result([self._ref("chunk-1")]))
         self.assertNotIn("pageImageUrl", result[0])
@@ -260,6 +274,37 @@ class TestExtractCitations(unittest.TestCase):
         ref = {"content": {"text": "text"}, "metadata": {"chunkId": "chunk-x"}, "location": {}}
         result = extract_citations(self._rag_result([ref]))
         self.assertEqual(result[0]["source"], "")
+
+
+class TestRefreshPresignedUrls(unittest.TestCase):
+    """Re-presigns persisted citations on history hydration."""
+
+    class _FakeS3:
+        def __init__(self):
+            self.calls = 0
+        def generate_presigned_url(self, op, Params, ExpiresIn):
+            self.calls += 1
+            return f"https://fresh.test/{Params['Key']}?nonce={self.calls}"
+
+    def test_strips_stale_url_and_signs_fresh_one_from_key(self):
+        s3 = self._FakeS3()
+        citations = [{
+            "source": "Employment Act 2007",
+            "chunkId": "chunk-1",
+            "pageImageKey": "page-images/employment-act-2007/page-45.pdf",
+            "pageImageUrl": "https://stale.test/expired",
+        }]
+        refreshed = refresh_presigned_urls(citations, s3_client=s3, bucket="haki-ai-data")
+        self.assertIn("nonce=1", refreshed[0]["pageImageUrl"])
+        self.assertEqual(refreshed[0]["pageImageKey"], citations[0]["pageImageKey"])
+        self.assertEqual(citations[0]["pageImageUrl"], "https://stale.test/expired")
+
+    def test_passes_through_citations_without_key(self):
+        s3 = self._FakeS3()
+        citations = [{"source": "X", "chunkId": "c"}]
+        refreshed = refresh_presigned_urls(citations, s3_client=s3, bucket="haki-ai-data")
+        self.assertNotIn("pageImageUrl", refreshed[0])
+        self.assertEqual(s3.calls, 0)
 
 
 # ── classifier ────────────────────────────────────────────────────────────────
@@ -559,6 +604,7 @@ class TestLambdaHandler(unittest.TestCase):
 
         self._orig_get_graph = h.get_compiled_graph
         self._orig_make_cw = h.make_cloudwatch
+        self._orig_load_history = h.load_history
 
         self.graph = _FakeCompiledGraph({
             "messages": [],
@@ -576,10 +622,14 @@ class TestLambdaHandler(unittest.TestCase):
 
         h.make_cloudwatch = lambda config: _FakeCloudWatch()
 
+        self.history_payload: list[dict] = []
+        h.load_history = lambda config, session_id: self.history_payload
+
     def tearDown(self):
         import handler as h
         h.get_compiled_graph = self._orig_get_graph
         h.make_cloudwatch = self._orig_make_cw
+        h.load_history = self._orig_load_history
 
     def _invoke(self, body: dict) -> dict:
         event = {"body": json.dumps(body)}
@@ -629,6 +679,45 @@ class TestLambdaHandler(unittest.TestCase):
         result = self._invoke({"message": "hi"})
         self.assertEqual(result["headers"]["Access-Control-Allow-Origin"], "*")
 
+    def test_history_get_returns_empty_for_new_session(self):
+        result = lambda_handler(
+            {
+                "requestContext": {"http": {"method": "GET", "path": "/chat/history"}},
+                "queryStringParameters": {"sessionId": "unknown"},
+            },
+            None,
+        )
+        self.assertEqual(result["statusCode"], 200)
+        body = json.loads(result["body"])
+        self.assertEqual(body["messages"], [])
+        self.assertEqual(body["sessionId"], "unknown")
+
+    def test_history_get_forwards_session_id_and_returns_messages(self):
+        self.history_payload = [
+            {"id": "m1", "role": "user", "content": "My name is Dave"},
+            {"id": "m2", "role": "assistant", "content": "Nice to meet you.", "language": "english"},
+        ]
+        result = lambda_handler(
+            {
+                "requestContext": {"http": {"method": "GET", "path": "/chat/history"}},
+                "queryStringParameters": {"sessionId": "sess-1"},
+            },
+            None,
+        )
+        body = json.loads(result["body"])
+        self.assertEqual(len(body["messages"]), 2)
+        self.assertEqual(body["messages"][0]["content"], "My name is Dave")
+
+    def test_history_get_400_when_session_id_missing(self):
+        result = lambda_handler(
+            {
+                "requestContext": {"http": {"method": "GET", "path": "/chat/history"}},
+                "queryStringParameters": {},
+            },
+            None,
+        )
+        self.assertEqual(result["statusCode"], 400)
+
     def test_blocked_response_passes_through_from_graph(self):
         self.graph._final_state = {
             "messages": [],
@@ -653,6 +742,7 @@ if __name__ == "__main__":
         TestBuildChatSystemPrompt,
         TestCheckGuardrailBlock,
         TestExtractCitations,
+        TestRefreshPresignedUrls,
         TestClassifierParsing,
         TestClassifyIntent,
         TestInvokeChat,

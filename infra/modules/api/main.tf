@@ -15,7 +15,7 @@ resource "aws_apigatewayv2_api" "chat" {
 
   cors_configuration {
     allow_origins = ["*"]
-    allow_methods = ["POST", "OPTIONS"]
+    allow_methods = ["GET", "POST", "OPTIONS"]
     allow_headers = ["Content-Type", "Authorization"]
     max_age       = 300
   }
@@ -37,6 +37,17 @@ resource "aws_apigatewayv2_integration" "lambda" {
 resource "aws_apigatewayv2_route" "chat" {
   api_id    = aws_apigatewayv2_api.chat.id
   route_key = "POST /chat"
+  target    = "integrations/${aws_apigatewayv2_integration.lambda.id}"
+}
+
+# ── Route: GET /chat/history ───────────────────────────────────────────────────
+# Returns the persisted conversation for a given sessionId so the frontend can
+# rehydrate the chat UI after a page refresh. Lambda reads the LangGraph
+# checkpointer and re-presigns citation pageImageUrls on every call.
+
+resource "aws_apigatewayv2_route" "chat_history" {
+  api_id    = aws_apigatewayv2_api.chat.id
+  route_key = "GET /chat/history"
   target    = "integrations/${aws_apigatewayv2_integration.lambda.id}"
 }
 

@@ -16,7 +16,7 @@ import uuid
 
 from clients import make_cloudwatch
 from config import load_config
-from graph import get_compiled_graph
+from graph import get_compiled_graph, load_history
 from metrics import elapsed_ms, emit_metrics, now_ms
 
 
@@ -24,9 +24,17 @@ def lambda_handler(event, context):
     """
     Main Lambda entry point. Called by API Gateway HTTP API.
 
-    Expected request body: { "message": "<user question>", "sessionId": "<uuid>" }
-    Response body:         { "response", "citations", "language", "blocked", "sessionId" }
+    Routes:
+      POST /chat                     → chat turn
+      GET  /chat/history?sessionId=  → full persisted conversation
     """
+    method, path = _method_and_path(event)
+    if method == "GET" and path.rstrip("/") == "/chat/history":
+        return _handle_history(event)
+    return _handle_chat(event)
+
+
+def _handle_chat(event):
     config = load_config()
     cloudwatch = make_cloudwatch(config)
     start = now_ms()
@@ -68,7 +76,7 @@ def lambda_handler(event, context):
         })
 
     except Exception as err:
-        print(f"Unhandled error: {err}")
+        print(f"Unhandled error (chat): {err}")
         emit_metrics(
             cloudwatch,
             language=language,
@@ -78,6 +86,35 @@ def lambda_handler(event, context):
             failed=True,
         )
         return _response(500, {"error": "Internal server error"})
+
+
+def _handle_history(event):
+    """
+    Returns { messages: [{id, role, content, citations?, language?, blocked?}], sessionId }.
+    Safe for brand-new sessions — returns an empty list.
+    """
+    try:
+        config = load_config()
+        params = (event.get("queryStringParameters") or {})
+        session_id = (params.get("sessionId") or "").strip()
+        if not session_id:
+            return _response(400, {"error": "sessionId is required"})
+        messages = load_history(config, session_id)
+        return _response(200, {"messages": messages, "sessionId": session_id})
+    except Exception as err:
+        print(f"Unhandled error (history): {err}")
+        return _response(500, {"error": "Internal server error"})
+
+
+def _method_and_path(event) -> tuple[str, str]:
+    """
+    Extracts (method, path) from an API Gateway v2 HTTP event. Falls back to
+    top-level keys when called from server_local.py which hand-rolls the event.
+    """
+    http = (event.get("requestContext") or {}).get("http") or {}
+    method = http.get("method") or event.get("httpMethod") or event.get("method") or "POST"
+    path = http.get("path") or event.get("rawPath") or event.get("path") or "/chat"
+    return method.upper(), path
 
 
 def _response(status_code: int, body: dict) -> dict:

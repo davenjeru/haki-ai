@@ -1,4 +1,4 @@
-import type { ChatResponse, Citation, DetectedLanguage } from '../types/chat'
+import type { ChatMessage, ChatResponse, Citation, DetectedLanguage } from '../types/chat'
 
 const BLOCKED_COPY =
   'Mimi ni msaidizi wa kisheria wa Kenya tu.\n\nI can only help with Kenyan legal matters.'
@@ -206,4 +206,50 @@ export async function sendChatMessage(message: string): Promise<ChatResponse> {
   }
 
   return parseChatResponse(data)
+}
+
+// ── History hydration ────────────────────────────────────────────────────────
+// GET /chat/history?sessionId=... — returns the persisted conversation so a
+// browser refresh can restore the UI. Backed by the LangGraph checkpointer;
+// citation pageImageUrls are re-presigned on every call so they're always fresh.
+
+function parseHistoryMessage(v: unknown): ChatMessage | null {
+  if (!isRecord(v)) return null
+  const id = typeof v.id === 'string' && v.id ? v.id : `${Date.now()}-${Math.random().toString(16).slice(2)}`
+  const role = v.role === 'user' || v.role === 'assistant' ? v.role : null
+  const content = typeof v.content === 'string' ? v.content : ''
+  if (!role || !content) return null
+  const msg: ChatMessage = { id, role, content }
+  if (role === 'assistant') {
+    if (Array.isArray(v.citations)) {
+      const citations = v.citations.map(parseCitation).filter((c): c is Citation => c !== null)
+      if (citations.length > 0) msg.citations = citations
+    }
+    if (v.language === 'english' || v.language === 'swahili' || v.language === 'mixed') {
+      msg.language = v.language as DetectedLanguage
+    }
+    if (v.blocked === true) msg.blocked = true
+  }
+  return msg
+}
+
+export async function fetchChatHistory(sessionId: string): Promise<ChatMessage[]> {
+  // Mock mode → no server to hit. Returning empty is the right UX (the mock
+  // has no persistence either) and matches the "fresh chat" contract.
+  if (isMockMode()) return []
+  const base = apiBase()
+  if (base === undefined) return []
+  const url = `${base}/chat/history?sessionId=${encodeURIComponent(sessionId)}`
+  const res = await fetch(url, { method: 'GET' })
+  if (!res.ok) {
+    // Brand-new sessions return 200 with an empty list; a non-2xx here means
+    // something else went wrong. Swallow the error so an offline backend
+    // doesn't block the UI from rendering the composer.
+    return []
+  }
+  const data: unknown = await res.json().catch(() => null)
+  if (!isRecord(data)) return []
+  const raw = data.messages
+  if (!Array.isArray(raw)) return []
+  return raw.map(parseHistoryMessage).filter((m): m is ChatMessage => m !== null)
 }

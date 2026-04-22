@@ -25,15 +25,17 @@ Routing:
 from __future__ import annotations
 
 import os
+import uuid
 from typing import Annotated, TypedDict
 
+from langchain_core.messages import AIMessage
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 
 from adapters import BedrockRAGAdapter, ComprehendAdapter, LocalRAGAdapter
 from chat_node import invoke_chat
 from checkpointer import DynamoDBSaver
-from citations import extract_citations
+from citations import extract_citations, refresh_presigned_urls
 from classifier import classify_intent
 from clients import (
     make_bedrock_agent_runtime,
@@ -100,6 +102,23 @@ def _normalize_message(m) -> dict:
     return {"role": role, "content": content}
 
 
+def _message_metadata(m) -> dict:
+    """
+    Returns the additional_kwargs dict attached to a LangChain message, or
+    an empty dict for plain message dicts. Used by load_history() to
+    reconstruct per-turn citations / language / blocked from state.
+    """
+    if isinstance(m, dict):
+        return {}
+    return dict(getattr(m, "additional_kwargs", {}) or {})
+
+
+def _message_id(m) -> str | None:
+    if isinstance(m, dict):
+        return m.get("id")
+    return getattr(m, "id", None)
+
+
 def _as_role_content(messages: list) -> list[dict]:
     return [_normalize_message(m) for m in messages]
 
@@ -157,6 +176,31 @@ def _build_nodes(config):
         )
         return {"needs_rag": needs_rag}
 
+    def _assistant_message(
+        *, content: str, citations: list[dict], language: str, blocked: bool
+    ) -> AIMessage:
+        """
+        Builds an AIMessage whose additional_kwargs carry everything the
+        frontend needs to render a historical turn: citations (with
+        pageImageKey for re-presigning), language, blocked flag, and a
+        stable turn_id used as the React key. Presigned pageImageUrls
+        are intentionally stripped before persistence because they
+        expire after ~1 hour; load_history() re-presigns on read.
+        """
+        persistable_citations = [
+            {k: v for k, v in c.items() if k != "pageImageUrl"}
+            for c in citations
+        ]
+        return AIMessage(
+            content=content,
+            id=str(uuid.uuid4()),
+            additional_kwargs={
+                "citations": persistable_citations,
+                "language": language,
+                "blocked": blocked,
+            },
+        )
+
     def rag_node(state: AgentState) -> dict:
         user_msg = _latest_user_message(state.get("messages", []))
         language = state.get("language", "english")
@@ -176,7 +220,12 @@ def _build_nodes(config):
                 "response_text": BILINGUAL_REFUSAL,
                 "citations": [],
                 "blocked": True,
-                "messages": [{"role": "assistant", "content": BILINGUAL_REFUSAL}],
+                "messages": [_assistant_message(
+                    content=BILINGUAL_REFUSAL,
+                    citations=[],
+                    language=language,
+                    blocked=True,
+                )],
             }
         citations = extract_citations(result, s3_client=s3, bucket=config.s3_bucket)
         response_text = result.get("output", {}).get("text", "")
@@ -185,13 +234,19 @@ def _build_nodes(config):
             "citations": citations,
             "blocked": False,
             "kb_session_id": result.get("sessionId"),
-            "messages": [{"role": "assistant", "content": response_text}],
+            "messages": [_assistant_message(
+                content=response_text,
+                citations=citations,
+                language=language,
+                blocked=False,
+            )],
         }
 
     def chat_node(state: AgentState) -> dict:
+        language = state.get("language", "english")
         response_text = invoke_chat(
             _as_role_content(state.get("messages", [])),
-            state.get("language", "english"),
+            language,
             bedrock_runtime,
             config.bedrock_model_id,
         )
@@ -199,7 +254,12 @@ def _build_nodes(config):
             "response_text": response_text,
             "citations": [],
             "blocked": False,
-            "messages": [{"role": "assistant", "content": response_text}],
+            "messages": [_assistant_message(
+                content=response_text,
+                citations=[],
+                language=language,
+                blocked=False,
+            )],
         }
 
     return {
@@ -253,3 +313,49 @@ def get_compiled_graph(config):
         checkpointer = DynamoDBSaver(table)
         _compiled_graph = build_graph(config, checkpointer)
     return _compiled_graph
+
+
+# ── History hydration ────────────────────────────────────────────────────────
+
+def load_history(config, session_id: str) -> list[dict]:
+    """
+    Returns the persisted conversation for a given sessionId as a list of
+    ChatMessage-shaped dicts ready for the frontend:
+
+      [{ id, role: "user", content }, ...,
+       { id, role: "assistant", content, citations, language, blocked }]
+
+    Citations are re-presigned here so pageImageUrls are always fresh. If
+    the session has no checkpoint yet (brand-new sessionId), an empty list
+    is returned — this is the normal path for a first-visit user.
+    """
+    graph = get_compiled_graph(config)
+    state = graph.get_state({"configurable": {"thread_id": session_id}})
+    if not state or not state.values:
+        return []
+    messages = state.values.get("messages", []) or []
+
+    s3 = make_s3(config)
+    out: list[dict] = []
+    for m in messages:
+        normalized = _normalize_message(m)
+        content = normalized["content"]
+        if not content:
+            continue
+        msg: dict = {
+            "id": _message_id(m) or str(uuid.uuid4()),
+            "role": normalized["role"],
+            "content": content,
+        }
+        meta = _message_metadata(m)
+        if normalized["role"] == "assistant":
+            stored = meta.get("citations") or []
+            msg["citations"] = refresh_presigned_urls(
+                stored, s3_client=s3, bucket=config.s3_bucket,
+            )
+            if meta.get("language"):
+                msg["language"] = meta["language"]
+            if meta.get("blocked"):
+                msg["blocked"] = True
+        out.append(msg)
+    return out

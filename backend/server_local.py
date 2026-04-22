@@ -55,21 +55,44 @@ class _Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length).decode("utf-8")
 
-        result = lambda_handler({"body": body}, None)
+        result = lambda_handler(
+            {"body": body, "method": "POST", "path": "/chat"}, None,
+        )
+        self._forward(result)
 
-        self.send_response(result["statusCode"])
-        for key, val in result.get("headers", {}).items():
-            self.send_header(key, val)
-        self.end_headers()
-        self.wfile.write(result["body"].encode("utf-8"))
+    def do_GET(self):
+        from urllib.parse import urlparse, parse_qs
+
+        parsed = urlparse(self.path)
+        if parsed.path.rstrip("/") != "/chat/history":
+            self._send(404, {"error": "Not found"})
+            return
+        qs = parse_qs(parsed.query)
+        params = {k: v[0] for k, v in qs.items()}
+        result = lambda_handler(
+            {
+                "method": "GET",
+                "path": "/chat/history",
+                "queryStringParameters": params,
+            },
+            None,
+        )
+        self._forward(result)
 
     def do_OPTIONS(self):
         # Handle CORS preflight so browser fetch works without the Vite proxy
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.end_headers()
+
+    def _forward(self, result):
+        self.send_response(result["statusCode"])
+        for key, val in result.get("headers", {}).items():
+            self.send_header(key, val)
+        self.end_headers()
+        self.wfile.write(result["body"].encode("utf-8"))
 
     def _send(self, status: int, body: dict):
         payload = json.dumps(body).encode("utf-8")

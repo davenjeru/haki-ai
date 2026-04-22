@@ -51,6 +51,34 @@ def _presign(s3_client, bucket: str, key: str) -> str | None:
         return None
 
 
+def refresh_presigned_urls(
+    citations: list[dict],
+    *,
+    s3_client,
+    bucket: str,
+) -> list[dict]:
+    """
+    Returns a new list of citations with `pageImageUrl` re-presigned from
+    the persisted `pageImageKey`. Citations without a `pageImageKey` or
+    with a key outside the allowed prefix pass through unchanged (minus
+    any stale pageImageUrl).
+
+    Used by the history hydration path where stored citations may carry a
+    presigned URL that has since expired.
+    """
+    refreshed: list[dict] = []
+    for c in citations:
+        out = dict(c)
+        out.pop("pageImageUrl", None)
+        key = out.get("pageImageKey")
+        if key:
+            url = _presign(s3_client, bucket, key)
+            if url:
+                out["pageImageUrl"] = url
+        refreshed.append(out)
+    return refreshed
+
+
 def extract_citations(
     rag_result: dict,
     *,
@@ -97,6 +125,10 @@ def extract_citations(
 
             page_image_key = meta.get("pageImageKey")
             if page_image_key:
+                # Persisted alongside the citation so history hydration can
+                # re-presign a fresh URL each time (presigned URLs expire
+                # after _PRESIGN_TTL_SECONDS ≈ 1 hour).
+                citation["pageImageKey"] = page_image_key
                 url = _presign(s3_client, bucket, page_image_key)
                 if url:
                     citation["pageImageUrl"] = url
