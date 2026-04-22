@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { fetchChatHistory, getSessionId, sendChatMessage } from '../api/chatClient'
+import { useI18n } from '../lib/I18nContext'
 import { placeholderForLanguage } from '../lib/placeholders'
 import type { ChatMessage, Citation, DetectedLanguage } from '../types/chat'
 import { Composer } from './Composer'
+import { LanguageToggle } from './LanguageToggle'
 import { MessageThread } from './MessageThread'
 import { SourcePanel } from './SourcePanel'
 
@@ -19,6 +21,7 @@ interface ActiveSource {
 }
 
 export function ChatApp() {
+  const { t, locale, onDetectedLanguage } = useI18n()
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [draft, setDraft] = useState('')
   const [loading, setLoading] = useState(false)
@@ -27,7 +30,7 @@ export function ChatApp() {
   const [activeSource, setActiveSource] = useState<ActiveSource | null>(null)
   const bottomRef = useRef<HTMLDivElement>(null)
 
-  const placeholder = useMemo(() => placeholderForLanguage(hintLang), [hintLang])
+  const placeholder = useMemo(() => placeholderForLanguage(locale, hintLang), [locale, hintLang])
 
   const activeCitations = useMemo<Citation[]>(() => {
     if (!activeSource) return []
@@ -46,7 +49,10 @@ export function ChatApp() {
         if (cancelled || restored.length === 0) return
         setMessages(restored)
         const lastAssistant = [...restored].reverse().find((m) => m.role === 'assistant')
-        if (lastAssistant?.language) setHintLang(lastAssistant.language)
+        if (lastAssistant?.language) {
+          setHintLang(lastAssistant.language)
+          onDetectedLanguage(lastAssistant.language)
+        }
         if (lastAssistant?.citations && lastAssistant.citations.length > 0) {
           const firstWithPage = lastAssistant.citations.findIndex((c) => Boolean(c.pageImageUrl))
           setActiveSource({
@@ -77,6 +83,7 @@ export function ChatApp() {
     try {
       const res = await sendChatMessage(text)
       setHintLang(res.language)
+      onDetectedLanguage(res.language)
       const assistantId = newId()
       const assistant: ChatMessage = {
         id: assistantId,
@@ -97,7 +104,7 @@ export function ChatApp() {
         })
       }
     } catch (e) {
-      const err = e instanceof Error ? e.message : 'Something went wrong'
+      const err = e instanceof Error ? e.message : t('errors.generic')
       setMessages((m) => [
         ...m,
         {
@@ -110,7 +117,7 @@ export function ChatApp() {
     } finally {
       setLoading(false)
     }
-  }, [draft, loading])
+  }, [draft, loading, t, onDetectedLanguage])
 
   const handleSelectCitation = useCallback((messageId: string, index: number) => {
     setActiveSource({ messageId, index })
@@ -123,16 +130,19 @@ export function ChatApp() {
   return (
     <div className="h-dvh flex flex-col max-w-[1400px] mx-auto px-4 py-5">
       <header className="mb-4 pb-4 border-b border-border flex-shrink-0">
-        <div className="mb-2">
-          <h1 className="font-display text-[1.75rem] font-semibold tracking-[-0.02em] m-0 mb-1 bg-[linear-gradient(120deg,#d8f3dc_0%,#95d5b2_45%,#52b788_100%)] bg-clip-text text-transparent">
-            Haki AI
-          </h1>
-          <p className="m-0 text-muted text-[0.95rem]">
-            Kenyan legal aid — answers with Act, Chapter, and Section citations
-          </p>
+        <div className="mb-2 flex items-start justify-between gap-4">
+          <div>
+            <h1 className="font-display text-[1.75rem] font-semibold tracking-[-0.02em] m-0 mb-1 bg-[linear-gradient(120deg,#d8f3dc_0%,#95d5b2_45%,#52b788_100%)] bg-clip-text text-transparent">
+              {t('header.title')}
+            </h1>
+            <p className="m-0 text-muted text-[0.95rem]">
+              {t('header.subtitle')}
+            </p>
+          </div>
+          <LanguageToggle />
         </div>
         <p className="mt-3 text-[0.8rem] text-muted tracking-[0.02em]">
-          Constitution 2010 · Employment Act 2007 · Land Act 2012
+          {t('header.corpus')}
         </p>
       </header>
 
@@ -141,7 +151,7 @@ export function ChatApp() {
           <main className="flex-1 overflow-y-auto pb-2">
             {messages.length === 0 && !loading && !hydrating && (
               <p className="mb-4 p-[1rem_1.1rem] bg-elevated border border-border rounded-[12px] text-muted text-[0.95rem]">
-                Ask a question about Kenyan law. The assistant replies in English or Swahili and cites the relevant provisions.
+                {t('chat.empty')}
               </p>
             )}
             <MessageThread
@@ -155,7 +165,7 @@ export function ChatApp() {
                 <span className="w-[6px] h-[6px] rounded-full bg-accent-bright animate-thinking" />
                 <span className="w-[6px] h-[6px] rounded-full bg-accent-bright animate-thinking [animation-delay:0.15s]" />
                 <span className="w-[6px] h-[6px] rounded-full bg-accent-bright animate-thinking [animation-delay:0.3s]" />
-                <span className="ml-[0.35rem]">Searching statutes…</span>
+                <span className="ml-[0.35rem]">{t('chat.loading')}</span>
               </div>
             )}
             <div ref={bottomRef} />
@@ -170,7 +180,7 @@ export function ChatApp() {
               placeholder={placeholder}
             />
             <p className="mt-[0.65rem] text-[0.75rem] text-muted">
-              Not legal advice. Verify citations against official sources.
+              {t('chat.disclaimer')}
             </p>
           </footer>
         </section>

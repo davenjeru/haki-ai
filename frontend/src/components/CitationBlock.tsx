@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { useI18n } from '../lib/I18nContext'
 import type { Citation } from '../types/chat'
 
 interface Props {
@@ -10,6 +11,7 @@ interface Props {
 }
 
 export function CitationBlock({ citations, activeIndex, onSelect }: Props) {
+  const { t } = useI18n()
   const [expanded, setExpanded] = useState(false)
   // Local pagination state. Kept in sync with activeIndex whenever the parent
   // changes it (e.g. when a new answer auto-selects the first citation).
@@ -50,7 +52,7 @@ export function CitationBlock({ citations, activeIndex, onSelect }: Props) {
         className="w-full flex items-center justify-between gap-2 bg-transparent border-0 p-0 cursor-pointer text-muted hover:text-white transition-colors"
       >
         <span className="text-[0.72rem] font-bold uppercase tracking-[0.08em]">
-          Citations ({total})
+          {t('citations.heading')} ({total})
         </span>
         <span
           aria-hidden="true"

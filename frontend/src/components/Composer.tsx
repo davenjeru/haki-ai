@@ -1,4 +1,5 @@
 import { useCallback, useRef } from 'react'
+import { useI18n } from '../lib/I18nContext'
 
 interface Props {
   value: string
@@ -9,6 +10,7 @@ interface Props {
 }
 
 export function Composer({ value, onChange, onSubmit, disabled, placeholder }: Props) {
+  const { t } = useI18n()
   const ta = useRef<HTMLTextAreaElement>(null)
 
   const submit = useCallback(() => {
@@ -19,7 +21,7 @@ export function Composer({ value, onChange, onSubmit, disabled, placeholder }: P
   return (
     <div className="flex gap-[0.6rem] items-end">
       <label className="sr-only" htmlFor="haki-message">
-        Your question
+        {t('composer.label')}
       </label>
       <textarea
         id="haki-message"
@@ -43,7 +45,7 @@ export function Composer({ value, onChange, onSubmit, disabled, placeholder }: P
         disabled={disabled || !value.trim()}
         onClick={submit}
       >
-        {disabled ? '…' : 'Send'}
+        {disabled ? '…' : t('composer.send')}
       </button>
     </div>
   )

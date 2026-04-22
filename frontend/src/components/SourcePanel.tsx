@@ -1,3 +1,4 @@
+import { useI18n } from '../lib/I18nContext'
 import type { Citation } from '../types/chat'
 import { PageCarousel } from './PageCarousel'
 
@@ -11,6 +12,7 @@ interface Props {
 }
 
 export function SourcePanel({ citations, activeIndex, onIndexChange }: Props) {
+  const { t } = useI18n()
   const imageUrls = citations
     .map((c) => c.pageImageUrl)
     .filter((url): url is string => typeof url === 'string')
@@ -19,15 +21,15 @@ export function SourcePanel({ citations, activeIndex, onIndexChange }: Props) {
     <aside
       className="flex flex-col gap-3 h-full min-h-0 rounded-[12px] bg-elevated border border-border p-4"
       role="complementary"
-      aria-label="Source page viewer"
+      aria-label={t('source.title')}
     >
       <header className="flex items-baseline justify-between gap-2">
         <h2 className="font-display text-[1.05rem] font-semibold tracking-[-0.01em] m-0 text-strong">
-          Source page
+          {t('source.title')}
         </h2>
         {imageUrls.length > 0 && (
           <span className="text-[0.72rem] text-muted tracking-[0.04em] uppercase">
-            {activeIndex + 1} of {imageUrls.length}
+            {t('source.counter', { current: activeIndex + 1, total: imageUrls.length })}
           </span>
         )}
       </header>
@@ -74,12 +76,13 @@ function ActiveCitationLabel({ citation }: { citation: Citation | undefined }) {
 }
 
 function EmptyState({ hasCitations }: { hasCitations: boolean }) {
+  const { t } = useI18n()
   return (
     <div className="flex-1 rounded-[10px] border border-dashed border-border flex items-center justify-center px-4 py-10 text-center">
       <p className="m-0 text-[0.82rem] text-muted leading-[1.5]">
         {hasCitations
-          ? 'No source page available for this citation.'
-          : 'Ask a question to see the source pages from Kenyan statutes here.'}
+          ? t('source.empty.unavailable')
+          : t('source.empty.noCitations')}
       </p>
     </div>
   )
