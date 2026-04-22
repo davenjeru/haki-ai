@@ -7,7 +7,7 @@ should call boto3.client() directly — add a make_X() function here instead.
 
 import boto3
 from botocore.config import Config as BotoConfig
-from config import Config
+from app.config import Config
 
 
 def _localstack_kwargs(config: Config) -> dict:
@@ -90,6 +90,16 @@ def make_dynamodb_table(config: Config, table_name: str):
             aws_secret_access_key="test",
         ).Table(table_name)
     return boto3.resource("dynamodb", region_name=config.aws_region).Table(table_name)
+
+
+def make_sagemaker_runtime(config: Config):
+    """
+    SageMaker Runtime client used to call the fine-tuned Llama-3.1-8B
+    endpoint when USE_FINETUNED_MODEL=true. LocalStack does not support
+    SageMaker inference, so this always targets real AWS — the backend
+    falls back to Bedrock automatically on any error.
+    """
+    return boto3.client("sagemaker-runtime", region_name=config.aws_region)
 
 
 def make_s3(config: Config):

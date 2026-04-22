@@ -5,21 +5,30 @@ Each adapter wraps a boto3 client and handles two things:
   1. Presents a simplified interface (only the methods handler.py needs).
   2. Papers over LocalStack limitations so business logic stays clean.
 
-Business logic functions receive adapters, not raw boto3 clients.
+Phase 1 advanced-RAG split:
+  The RAG adapter now exposes TWO methods instead of one monolithic
+  `retrieve_and_generate`:
 
-LocalRAGAdapter is a local-only composite that mimics the Bedrock KB
-retrieve_and_generate interface using ChromaDB + Bedrock InvokeModel.
-It is never instantiated in the Lambda environment.
+    - `retrieve(query, top_k, metadata_filter) -> list[dict]`
+      Returns raw ranked chunks. Downstream rerank/fuse/filter code treats
+      both adapters symmetrically.
 
-When chroma_host is set, LocalRAGAdapter uses _ChromaHttpClient to query
-the ChromaDB HTTP server over the network (same pattern as Bedrock KB →
-S3 Vectors in prod). This lets the Lambda container reach ChromaDB running
-on the host machine via host.docker.internal without needing the chromadb
-package (and its native hnswlib binary) inside the Lambda zip.
+    - `generate(query, system_prompt, context, model_id) -> (text, stop_reason)`
+      Calls Claude InvokeModel with the already-assembled context from the
+      rerank stage. Guardrails attach here (prod only).
 
-When chroma_host is empty, LocalRAGAdapter falls back to ChromaDB
-PersistentClient for in-process access (test_e2e_local.py path).
+  The pipeline orchestrator in `rag/pipeline.py` owns the stages between
+  `retrieve` and `generate` (query expansion, RRF, rerank, filters).
+
+LocalRAGAdapter is a local-only composite used by `server_local.py` and
+`test_e2e_local.py`. BedrockRAGAdapter targets real AWS Bedrock KB + Cohere
+Rerank for production.
+
+When chroma_host is set, LocalRAGAdapter queries the ChromaDB HTTP server
+over the network. When empty, it uses ChromaDB\u2019s PersistentClient in-process.
 """
+
+from __future__ import annotations
 
 import json
 import urllib.error
@@ -59,10 +68,8 @@ class ComprehendAdapter:
 
 # ── RAG adapters ─────────────────────────────────────────────────────────────
 
-_S3_BUCKET = "haki-ai-data"
 _CHUNKS_PREFIX = "processed-chunks/"
 _CHROMA_COLLECTION = "haki_chunks"
-_TOP_K = 5
 
 _CHROMA_TENANT = "default_tenant"
 _CHROMA_DB = "default_database"
@@ -112,6 +119,7 @@ class _ChromaHttpClient:
         query_embeddings: list[list[float]],
         n_results: int = 5,
         include: list[str] | None = None,
+        where: dict | None = None,
     ) -> dict:
         col_id = self._get_collection_id()
         payload: dict = {
@@ -119,37 +127,51 @@ class _ChromaHttpClient:
             "n_results": n_results,
             "include": include or ["documents", "metadatas", "distances"],
         }
+        if where:
+            payload["where"] = where
         return self._request("POST", f"/collections/{col_id}/query", payload)
 
 
 class LocalRAGAdapter:
     """
-    Mimics the Bedrock KB retrieve_and_generate interface for local testing.
+    Local-dev RAG adapter that mirrors the BedrockRAGAdapter interface.
 
-    Uses ChromaDB as the vector store and Bedrock InvokeModel for both Titan
-    embeddings and Claude generation. Embeddings always hit real AWS.
-
-    Two storage backends (selected at construction time):
-      - HTTP  (chroma_host set): queries ChromaDB HTTP server via _ChromaHttpClient.
-               Used by Lambda-in-Docker — no chromadb package needed in the zip.
-               host.docker.internal:8000 reaches the host from the container.
-      - In-process (chroma_host empty): uses chromadb.PersistentClient directly.
-               Used by test_e2e_local.py running outside Docker.
-
-    Returns a dict that matches the Bedrock KB response shape so that
-    citations.py and handler.py can treat local and prod identically.
+    Retrieval runs over a ChromaDB collection ingested from LocalStack S3;
+    embeddings + generation always hit real AWS Bedrock. Supports both
+    in-process (ChromaDB PersistentClient) and HTTP (ChromaDB server)
+    backends so the local Lambda-in-Docker and server_local.py paths both
+    work.
     """
 
     def __init__(
         self,
         bedrock_runtime,
+        bedrock_agent_runtime,
         embed_model: str,
         vectorstore_path: str,
+        *,
+        s3_client,
+        s3_bucket: str,
+        aws_region: str,
         chroma_host: str = "",
         chroma_port: int = 8000,
+        guardrail_id: str = "",
+        guardrail_version: str = "",
+        sagemaker_runtime=None,
+        sagemaker_endpoint_name: str = "",
+        use_finetuned_model: bool = False,
     ):
-        self._bedrock = bedrock_runtime
+        self._bedrock_runtime = bedrock_runtime
+        self._bedrock_agent_runtime = bedrock_agent_runtime
         self._embed_model = embed_model
+        self._s3_client = s3_client
+        self._s3_bucket = s3_bucket
+        self._aws_region = aws_region
+        self._guardrail_id = guardrail_id
+        self._guardrail_version = guardrail_version
+        self._sagemaker_runtime = sagemaker_runtime
+        self._sagemaker_endpoint_name = sagemaker_endpoint_name
+        self._use_finetuned_model = use_finetuned_model
 
         if chroma_host:
             self._collection = _ChromaHttpClient(chroma_host, chroma_port)
@@ -161,75 +183,118 @@ class LocalRAGAdapter:
                 metadata={"hnsw:space": "cosine"},
             )
 
-    # ── Public interface ──────────────────────────────────────────────────────
+    # ── Catalog accessors used by the RAG pipeline ────────────────────────────
 
-    def retrieve_and_generate(
+    @property
+    def catalog_s3_client(self):
+        return self._s3_client
+
+    @property
+    def catalog_bucket(self) -> str:
+        return self._s3_bucket
+
+    @property
+    def bedrock_runtime(self):
+        return self._bedrock_runtime
+
+    @property
+    def bedrock_agent_runtime(self):
+        return self._bedrock_agent_runtime
+
+    @property
+    def aws_region(self) -> str:
+        return self._aws_region
+
+    # ── Public RAG interface ─────────────────────────────────────────────────
+
+    def retrieve(
+        self,
+        query: str,
+        top_k: int = 30,
+        metadata_filter: dict | None = None,
+    ) -> list[dict]:
+        """
+        Embeds `query` with Titan v2 and queries ChromaDB. Returns results
+        in the Bedrock-KB-compatible shape so the pipeline treats both
+        adapters identically.
+        """
+        query = (query or "").strip()
+        if not query:
+            return []
+        vector = self._embed(query)
+        where = self._chroma_where(metadata_filter)
+
+        if where is not None:
+            results = self._collection.query(
+                query_embeddings=[vector],
+                n_results=top_k,
+                include=["documents", "metadatas", "distances"],
+                where=where,
+            )
+        else:
+            results = self._collection.query(
+                query_embeddings=[vector],
+                n_results=top_k,
+                include=["documents", "metadatas", "distances"],
+            )
+
+        documents: list[str] = (results.get("documents") or [[]])[0]
+        metadatas: list[dict] = (results.get("metadatas") or [[]])[0]
+        distances: list[float] = (results.get("distances") or [[]])[0] or []
+
+        out: list[dict] = []
+        for i, (doc, meta) in enumerate(zip(documents, metadatas)):
+            chunk_id = (meta or {}).get("chunkId") or ""
+            score = 1.0 - float(distances[i]) if i < len(distances) else 0.0
+            out.append({
+                "content": {"text": doc},
+                "metadata": meta or {},
+                "location": {
+                    "type": "S3",
+                    "s3Location": {
+                        "uri": f"s3://{self._s3_bucket}/{_CHUNKS_PREFIX}{chunk_id}.txt"
+                    },
+                },
+                "score": score,
+            })
+        return out
+
+    def generate(
         self,
         query: str,
         system_prompt: str,
+        context: str,
         model_id: str,
-        kb_session_id: str | None = None,  # noqa: ARG002 — accepted for interface parity with BedrockRAGAdapter
-    ) -> dict:
-        """
-        Retrieve relevant chunks from ChromaDB, then generate a response via
-        Claude InvokeModel. Returns the same shape as Bedrock KB:
+    ) -> tuple[str, str]:
+        """Calls Claude InvokeModel (or the fine-tuned SageMaker endpoint)."""
+        if self._use_finetuned_model and self._sagemaker_endpoint_name and self._sagemaker_runtime is not None:
+            try:
+                from rag.sagemaker_generator import generate as _sm_generate
+                return _sm_generate(
+                    query=query,
+                    system_prompt=system_prompt,
+                    context=context,
+                    endpoint_name=self._sagemaker_endpoint_name,
+                    sagemaker_runtime=self._sagemaker_runtime,
+                )
+            except Exception as err:
+                print(f"[rag.generate] SageMaker endpoint failed, falling back to Bedrock: {err}")
 
-          {
-            "output": { "text": str },
-            "citations": [ { "retrievedReferences": [ { "content", "metadata", "location" } ] } ],
-            "stopReason": str,
-          }
-
-        kb_session_id is accepted (and ignored) so the call signature matches
-        BedrockRAGAdapter; the local path has no server-side session to persist.
-        """
-        query_vector = self._embed(query)
-
-        results = self._collection.query(
-            query_embeddings=[query_vector],
-            n_results=_TOP_K,
-            include=["documents", "metadatas", "distances"],
+        from rag.generator import generate as _generate
+        return _generate(
+            query=query,
+            system_prompt=system_prompt,
+            context=context,
+            model_id=model_id,
+            bedrock_runtime=self._bedrock_runtime,
+            guardrail_id=self._guardrail_id,
+            guardrail_version=self._guardrail_version,
         )
-
-        documents: list[str] = results["documents"][0]
-        metadatas: list[dict] = results["metadatas"][0]
-
-        context = self._build_context(documents, metadatas)
-        user_content = f"<context>\n{context}\n</context>\n\n{query}"
-
-        answer_text, stop_reason = self._invoke_claude(model_id, system_prompt, user_content)
-
-        citations = [
-            {
-                "retrievedReferences": [
-                    {
-                        "content": {"text": doc},
-                        "metadata": meta,
-                        "location": {
-                            "type": "S3",
-                            "s3Location": {
-                                "uri": (
-                                    f"s3://{_S3_BUCKET}/{_CHUNKS_PREFIX}"
-                                    f"{meta.get('chunkId', '')}.txt"
-                                )
-                            },
-                        },
-                    }
-                ]
-            }
-            for doc, meta in zip(documents, metadatas)
-        ]
-
-        return {
-            "output": {"text": answer_text},
-            "citations": citations,
-            "stopReason": stop_reason,
-        }
 
     # ── Private helpers ───────────────────────────────────────────────────────
 
     def _embed(self, text: str) -> list[float]:
-        response = self._bedrock.invoke_model(
+        response = self._bedrock_runtime.invoke_model(
             modelId=self._embed_model,
             body=json.dumps({"inputText": text}),
             contentType="application/json",
@@ -244,116 +309,167 @@ class LocalRAGAdapter:
                 f"(model={self._embed_model}): {raw[:200]!r}"
             ) from err
 
-    def _invoke_claude(
-        self, model_id: str, system_prompt: str, user_content: str
-    ) -> tuple[str, str]:
-        body = {
-            "anthropic_version": "bedrock-2023-05-31",
-            "max_tokens": 1024,
-            "system": system_prompt,
-            "messages": [{"role": "user", "content": user_content}],
-        }
-        response = self._bedrock.invoke_model(
-            modelId=model_id,
-            body=json.dumps(body),
-            contentType="application/json",
-            accept="application/json",
-        )
-        result = json.loads(response["body"].read())
-        text = result.get("content", [{}])[0].get("text", "")
-        stop_reason = result.get("stop_reason", "end_turn")
-        return text, stop_reason
-
     @staticmethod
-    def _build_context(documents: list[str], metadatas: list[dict]) -> str:
-        parts = []
-        for doc, meta in zip(documents, metadatas):
-            header = " — ".join(
-                filter(None, [
-                    meta.get("source"),
-                    meta.get("chapter"),
-                    meta.get("section"),
-                    meta.get("title"),
-                ])
-            )
-            parts.append(f"[{header}]\n{doc}")
-        return "\n\n---\n\n".join(parts)
-
+    def _chroma_where(metadata_filter: dict | None) -> dict | None:
+        """
+        Translates our simple AND-of-equals filter into ChromaDB\u2019s query
+        syntax. Returns None when no filter is provided so we don\u2019t send
+        an empty `where` clause (ChromaDB rejects it).
+        """
+        if not metadata_filter:
+            return None
+        if len(metadata_filter) == 1:
+            key, value = next(iter(metadata_filter.items()))
+            return {key: {"$eq": value}}
+        return {"$and": [{k: {"$eq": v}} for k, v in metadata_filter.items()]}
 
 
 class BedrockRAGAdapter:
     """
-    Wraps the bedrock-agent-runtime boto3 client so it shares the same
-    retrieve_and_generate interface as LocalRAGAdapter.
+    Production RAG adapter backed by Bedrock KB (retrieve) + Bedrock
+    InvokeModel (generate). Cohere Rerank is handled by the pipeline, not
+    the adapter.
 
-    rag.py calls retrieve_and_generate() on whichever adapter it receives —
-    it never needs to know which environment it's in.
-
-    Supports Bedrock KB's native multi-turn sessions: when kb_session_id is
-    passed in, Bedrock uses it to maintain retrieval context across turns.
-    The server-generated sessionId is always echoed back in the response
-    under the "sessionId" key so the caller can thread it through state.
+    The old `retrieve_and_generate` path is retired; the advanced-RAG
+    pipeline runs retrieval and generation as separate steps so query
+    expansion, BM25 fusion, rerank, and TOC filtering can slot between
+    them. See `rag/pipeline.py` for the orchestrator.
     """
 
-    def __init__(self, client, config):
-        self._client = client
+    def __init__(
+        self,
+        bedrock_agent_runtime,
+        bedrock_runtime,
+        config,
+        *,
+        s3_client,
+        sagemaker_runtime=None,
+    ):
+        self._bedrock_agent_runtime = bedrock_agent_runtime
+        self._bedrock_runtime = bedrock_runtime
         self._config = config
+        self._s3_client = s3_client
+        self._sagemaker_runtime = sagemaker_runtime
 
-    def retrieve_and_generate(
+    @property
+    def catalog_s3_client(self):
+        return self._s3_client
+
+    @property
+    def catalog_bucket(self) -> str:
+        return self._config.s3_bucket
+
+    @property
+    def bedrock_runtime(self):
+        return self._bedrock_runtime
+
+    @property
+    def bedrock_agent_runtime(self):
+        return self._bedrock_agent_runtime
+
+    @property
+    def aws_region(self) -> str:
+        return self._config.aws_region
+
+    def retrieve(
+        self,
+        query: str,
+        top_k: int = 30,
+        metadata_filter: dict | None = None,
+    ) -> list[dict]:
+        """
+        Calls `bedrock-agent-runtime.retrieve` against the configured KB
+        and normalises the response to the standard adapter shape.
+        """
+        query = (query or "").strip()
+        if not query:
+            return []
+
+        kwargs: dict = {
+            "knowledgeBaseId": self._config.knowledge_base_id,
+            "retrievalQuery": {"text": query},
+            "retrievalConfiguration": {
+                "vectorSearchConfiguration": {
+                    "numberOfResults": top_k,
+                }
+            },
+        }
+        kb_filter = self._kb_filter(metadata_filter)
+        if kb_filter is not None:
+            kwargs["retrievalConfiguration"]["vectorSearchConfiguration"]["filter"] = kb_filter
+
+        response = self._bedrock_agent_runtime.retrieve(**kwargs)
+
+        out: list[dict] = []
+        for item in response.get("retrievalResults", []) or []:
+            content = item.get("content") or {}
+            metadata = item.get("metadata") or {}
+            location = item.get("location") or {}
+            score = float(item.get("score", 0.0))
+            out.append({
+                "content": {"text": content.get("text", "")},
+                "metadata": metadata,
+                "location": location,
+                "score": score,
+            })
+        return out
+
+    def generate(
         self,
         query: str,
         system_prompt: str,
+        context: str,
         model_id: str,
-        kb_session_id: str | None = None,
-    ) -> dict:
+    ) -> tuple[str, str]:
+        """Claude InvokeModel call with guardrail attached.
+
+        When the ``USE_FINETUNED_MODEL`` flag is set and a SageMaker
+        endpoint is configured, we call the fine-tuned Llama-3.1-8B
+        adapter instead. Any error falls back to Bedrock Claude so a
+        cold-start or endpoint blip never breaks the user request.
         """
-        Calls Bedrock KB retrieve_and_generate and returns the raw response.
-        The response already matches the expected shape:
-          { "output": { "text" }, "citations": [...], "stopReason": str,
-            "sessionId": str }
+        if (
+            self._config.use_finetuned_model
+            and self._config.sagemaker_endpoint_name
+            and self._sagemaker_runtime is not None
+        ):
+            try:
+                from rag.sagemaker_generator import generate as _sm_generate
+                return _sm_generate(
+                    query=query,
+                    system_prompt=system_prompt,
+                    context=context,
+                    endpoint_name=self._config.sagemaker_endpoint_name,
+                    sagemaker_runtime=self._sagemaker_runtime,
+                )
+            except Exception as err:
+                print(f"[rag.generate] SageMaker endpoint failed, falling back to Bedrock: {err}")
+
+        from rag.generator import generate as _generate
+        return _generate(
+            query=query,
+            system_prompt=system_prompt,
+            context=context,
+            model_id=model_id,
+            bedrock_runtime=self._bedrock_runtime,
+            guardrail_id=self._config.guardrail_id,
+            guardrail_version=self._config.guardrail_version,
+        )
+
+    @staticmethod
+    def _kb_filter(metadata_filter: dict | None) -> dict | None:
         """
-        # Bedrock accepts either a foundation-model ARN or an inference-profile
-        # ID as modelArn. Claude 4.x only supports inference profiles so we
-        # pass the ID (e.g. "us.anthropic.claude-haiku-4-5-...") directly.
-        kwargs: dict = {
-            "input": {"text": query},
-            "retrieveAndGenerateConfiguration": {
-                "type": "KNOWLEDGE_BASE",
-                "knowledgeBaseConfiguration": {
-                    "knowledgeBaseId": self._config.knowledge_base_id,
-                    "modelArn": model_id,
-                    "generationConfiguration": {
-                        "promptTemplate": {
-                            "textPromptTemplate": _wrap_prompt_template(system_prompt)
-                        },
-                        "guardrailConfiguration": {
-                            "guardrailId": self._config.guardrail_id,
-                            "guardrailVersion": self._config.guardrail_version,
-                        },
-                    },
-                },
-            },
-        }
-        if kb_session_id:
-            kwargs["sessionId"] = kb_session_id
-        return self._client.retrieve_and_generate(**kwargs)
-
-
-def _wrap_prompt_template(system_prompt: str) -> str:
-    """
-    Bedrock KB requires the textPromptTemplate to contain the
-    ``$search_results$`` placeholder so retrieved chunks can be injected,
-    and ``$output_format_instructions$`` is recommended so citation markers
-    stay parseable. Our `build_system_prompt` is a plain system message, so
-    we append the retrieval + query sections here rather than baking them
-    into prompts.py (which would break the LocalRAGAdapter path where we
-    build context ourselves).
-    """
-    return (
-        f"{system_prompt}\n\n"
-        "Search results to ground your answer (use only these; cite by source):\n"
-        "$search_results$\n\n"
-        "$output_format_instructions$"
-    )
-
-
+        Translates our simple AND-of-equals filter dict to Bedrock KB's
+        `retrievalFilter` JSON:
+          single key  \u2192 {"equals": {"key": "...", "value": "..."}}
+          multi keys  \u2192 {"andAll": [ { "equals": ... }, { "equals": ... } ]}
+        """
+        if not metadata_filter:
+            return None
+        terms = [
+            {"equals": {"key": k, "value": v}}
+            for k, v in metadata_filter.items()
+        ]
+        if len(terms) == 1:
+            return terms[0]
+        return {"andAll": terms}

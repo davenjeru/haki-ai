@@ -25,6 +25,8 @@ class Config:
     checkpoints_table: str
     environment: str
     langsmith_ssm_parameter: str
+    use_finetuned_model: bool
+    sagemaker_endpoint_name: str
 
 
 def load_config() -> Config:
@@ -61,4 +63,6 @@ def load_config() -> Config:
         checkpoints_table=os.environ.get("CHECKPOINTS_TABLE", "haki-ai-checkpoints"),
         environment=env,
         langsmith_ssm_parameter=os.environ.get("LANGSMITH_API_KEY_SSM_PARAMETER", ""),
+        use_finetuned_model=os.environ.get("USE_FINETUNED_MODEL", "").lower() in {"1", "true", "yes"},
+        sagemaker_endpoint_name=os.environ.get("SAGEMAKER_ENDPOINT_NAME", ""),
     )
