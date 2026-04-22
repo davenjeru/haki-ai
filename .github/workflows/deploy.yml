@@ -52,6 +52,17 @@ jobs:
       - name: Install uv (for Lambda layer build)
         uses: astral-sh/setup-uv@v3
 
+      # `data "archive_file" "lambda_layer_zip"` reads this directory at
+      # plan time. The directory is normally populated by the local-exec
+      # in `terraform_data.lambda_layer_build`, but on a fresh CI checkout
+      # it does not exist yet, so the data source fails with:
+      #   "error archiving directory: missing directory: .../.layer-build"
+      # Pre-create an empty skeleton so the data source has something to
+      # read; the terraform_data step then rm -rf's and rebuilds it with
+      # the real layer contents.
+      - name: Pre-create empty Lambda layer skeleton
+        run: mkdir -p infra/modules/compute/.layer-build/python
+
       - name: Terraform init
         working-directory: infra
         run: terraform init
