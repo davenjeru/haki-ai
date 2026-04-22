@@ -11,13 +11,12 @@
 pipeline/.tmp-chunks/
 pipeline/*.traineddata
 
-# Terraform
+# Terraform — state lives in the s3 backend (workspace-isolated), never on disk
 infra/.terraform/
 infra/.terraform.lock.hcl
 infra/*.tfstate
 infra/*.tfstate.backup
 infra/terraform.tfvars.local
-infra/local_backend_override.tf
 infra/modules/compute/lambda.zip
 
 # LocalStack volume (certs + license)

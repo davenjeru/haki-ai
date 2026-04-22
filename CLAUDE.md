@@ -241,9 +241,15 @@ limitations apply, inject into lambda_handler — no changes to business logic f
 - GuardrailBlocks > 20/hr
 
 ## Terraform state
-- Remote backend: S3 bucket haki-ai-terraform-state
-- Create manually before terraform init
-- Local: make local-apply (uses local.tfstate, no remote backend)
+- Remote backend: S3 bucket haki-ai-terraform-state (must exist before `terraform init`).
+- Environments are isolated via Terraform workspaces on the same backend:
+  - `default` workspace → key `terraform.tfstate` → prod (real AWS)
+  - `local`   workspace → key `env:/local/terraform.tfstate` → LocalStack
+- Flip between them with `terraform workspace select local|default` — no reinit.
+- Makefile targets do the select automatically:
+  - `make local-apply` / `make local-destroy` / `make local-output`
+  - `make apply` / `make destroy` / `make output` (prod)
+- Prod apply requires `TF_VAR_langsmith_api_key` (else tracing is disabled cleanly).
 
 ## Frontend (frontend/)
 - React + Vite + Tailwind v4 (@tailwindcss/vite plugin)
