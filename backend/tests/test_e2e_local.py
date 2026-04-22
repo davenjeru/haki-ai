@@ -32,9 +32,9 @@ os.environ["ENV"] = "local"
 os.environ.setdefault("BEDROCK_MODEL_ID", "us.anthropic.claude-haiku-4-5-20251001-v1:0")
 os.environ.setdefault("CHROMA_HOST", "")
 
-sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from handler import lambda_handler
+from app.handler import lambda_handler
 
 # ── Test cases ────────────────────────────────────────────────────────────────
 

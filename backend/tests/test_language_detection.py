@@ -17,12 +17,12 @@ Usage:
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from handler import detect_language
-from adapters import ComprehendAdapter
+from app.graph import _detect_language as detect_language
+from clients.adapters import ComprehendAdapter
 from clients import make_comprehend
-from config import load_config
+from app.config import load_config
 
 # ── Test cases ────────────────────────────────────────────────────────────────
 

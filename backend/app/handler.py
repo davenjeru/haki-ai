@@ -15,17 +15,17 @@ import json
 import uuid
 
 from clients import make_cloudwatch
-from config import load_config
+from app.config import load_config
 
 # NOTE: observability MUST be imported and bootstrapped before `graph` so
 # LANGSMITH_API_KEY lands in the environment before LangChain initialises
 # its tracer. Importing graph triggers the langchain import chain.
-from observability import bootstrap_langsmith, run_traced_turn
+from observability.tracing import bootstrap_langsmith, run_traced_turn
 
 bootstrap_langsmith(load_config())
 
-from graph import get_compiled_graph, load_history  # noqa: E402
-from metrics import elapsed_ms, emit_metrics, now_ms  # noqa: E402
+from app.graph import get_compiled_graph, load_history  # noqa: E402
+from observability.metrics import elapsed_ms, emit_metrics, now_ms  # noqa: E402
 
 
 def lambda_handler(event, context):

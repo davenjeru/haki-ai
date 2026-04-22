@@ -187,14 +187,23 @@ data "archive_file" "lambda_zip" {
 
   excludes = [
     ".venv",
+    ".venv/**",
     ".local-vectorstore", # local ChromaDB store — never used in prod
     ".local-vectorstore/**",
     "modules", # defensive: prevents any stray tf build artefacts from leaking in
     "modules/**",
     "__pycache__",
+    "**/__pycache__/**",
     "*.pyc",
-    "test_*.py",  # test runners — committed to git, not needed in Lambda
-    "*_local.py", # local-only scripts — committed to git, not needed in Lambda
+    "tests", # unit + e2e tests live in backend/tests/ after the 6a refactor
+    "tests/**",
+    "evals", # eval harness is dev-only; shipped via CI not Lambda
+    "evals/**",
+    "scripts", # prepare_finetune_data etc. — offline helpers only
+    "scripts/**",
+    "*_local.py", # legacy local-only scripts (pre-refactor, if any stragglers)
+    "app/server_local.py",
+    "app/ingest_local.py",
     "pyproject.toml",
     "uv.lock",
   ]
@@ -206,7 +215,7 @@ resource "aws_lambda_function" "handler" {
   function_name    = "${var.project_name}-handler"
   role             = aws_iam_role.lambda_exec.arn
   runtime          = "python3.12"
-  handler          = "handler.lambda_handler"
+  handler          = "app.handler.lambda_handler"
   filename         = data.archive_file.lambda_zip.output_path
   source_code_hash = data.archive_file.lambda_zip.output_base64sha256
   layers           = [aws_lambda_layer_version.deps.arn]

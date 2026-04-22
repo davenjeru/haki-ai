@@ -31,7 +31,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import boto3
 import chromadb
 
-from config import load_config
+from app.config import load_config
 
 S3_BUCKET = os.environ.get("S3_BUCKET", "haki-ai-data")
 CHUNKS_PREFIX = "processed-chunks/"

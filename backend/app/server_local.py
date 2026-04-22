@@ -66,7 +66,7 @@ os.environ.setdefault("CHROMA_HOST", "")
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from handler import lambda_handler
+from app.handler import lambda_handler
 
 PORT = int(os.environ.get("PORT", 8080))
 
