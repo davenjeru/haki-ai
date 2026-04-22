@@ -27,6 +27,13 @@ pipeline/volume/
 # Claude Code local settings
 .claude/
 
+# Cursor local settings (workspace MCP config holds API keys)
+.cursor/
+
+# Eval harness outputs (generated; only the directory itself is tracked)
+backend/evals/reports/*
+!backend/evals/reports/.gitkeep
+
 # Python (uv)
 backend/.venv/
 **/__pycache__/
