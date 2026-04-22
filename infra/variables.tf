@@ -80,3 +80,19 @@ variable "cloudfront_price_class" {
   type        = string
   default     = "PriceClass_100"
 }
+
+# ── GitHub Actions OIDC ──────────────────────────────────────────────────────
+# Wires the CI deploy workflow to an account-scoped IAM role via GitHub's
+# OIDC provider. No long-lived AWS keys live as GitHub secrets.
+
+variable "github_repository" {
+  description = "GitHub repo in `owner/name` form. The OIDC role's trust policy is locked to this repo so forks can't assume the deploy role."
+  type        = string
+  default     = "davenjeru/haki-ai"
+}
+
+variable "github_allowed_branches" {
+  description = "Branch names allowed to assume the deploy role. Keep tight to gate who can apply infra."
+  type        = list(string)
+  default     = ["main"]
+}

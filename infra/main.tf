@@ -164,3 +164,16 @@ module "web" {
   project_name = var.project_name
   price_class  = var.cloudfront_price_class
 }
+
+# ── GitHub Actions OIDC role (prod only) ─────────────────────────────────────
+# Lets the CI `deploy` + `eval-nightly` workflows assume a federated
+# role instead of storing long-lived AWS access keys as GitHub secrets.
+
+module "github_oidc" {
+  count = local.is_local ? 0 : 1
+
+  source           = "./modules/github_oidc"
+  project_name     = var.project_name
+  repository       = var.github_repository
+  allowed_branches = var.github_allowed_branches
+}

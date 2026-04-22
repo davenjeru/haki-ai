@@ -44,3 +44,10 @@ output "web_url" {
   description = "Public URL of the deployed frontend"
   value       = length(module.web) > 0 ? "https://${module.web[0].distribution_domain_name}" : ""
 }
+
+# ── CI/CD ────────────────────────────────────────────────────────────────────
+
+output "github_actions_role_arn" {
+  description = "IAM role ARN for the GitHub Actions deploy workflow. Paste into the `AWS_ROLE_TO_ASSUME` repo Variable."
+  value       = length(module.github_oidc) > 0 ? module.github_oidc[0].role_arn : ""
+}
