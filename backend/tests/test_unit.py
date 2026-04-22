@@ -15,17 +15,34 @@ import os
 import sys
 import unittest
 
-sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from adapters import ComprehendAdapter
-from chat_node import invoke_chat
-from checkpointer import DynamoDBSaver
-from citations import extract_citations, refresh_presigned_urls
-from classifier import classify_intent, _parse_needs_rag
-from graph import _detect_language
-import observability as obs
-from observability import _trace_metadata, bootstrap_langsmith
-from handler import lambda_handler
+from clients.adapters import ComprehendAdapter
+from agents.chat import invoke_chat
+from memory.checkpointer import DynamoDBSaver
+from rag.citations import extract_citations, refresh_presigned_urls
+from rag import bm25 as bm25_module
+from rag import catalog as catalog_module
+from rag import filters as rag_filters
+from rag import rrf as rag_rrf
+from rag.pipeline import run_rag
+from rag.query_expansion import _parse_variants, expand_query
+from agents.supervisor import _parse_routing, route_supervisor
+from agents.synthesizer import _dedup_citations, synthesize
+from evals.llm_judge import AXES, _parse_judge_response, judge
+from evals.loader import load_golden_set
+from evals.report import (
+    CaseScore,
+    _aggregate_judge,
+    _category_breakdown,
+    _overall_mean,
+    write_report,
+)
+from agents.classifier import classify_intent, _parse_needs_rag
+from app.graph import _detect_language
+from observability import tracing as obs
+from observability.tracing import _trace_metadata, bootstrap_langsmith
+from app.handler import lambda_handler
 from prompts import (
     BILINGUAL_REFUSAL,
     CLASSIFIER_PROMPT,
@@ -187,11 +204,11 @@ class TestCheckGuardrailBlock(unittest.TestCase):
 
 class TestExtractCitations(unittest.TestCase):
 
-    def _ref(self, chunk_id, **meta_overrides):
+    def _ref(self, chunk_id, *, section="Section 45", **meta_overrides):
         meta = {
             "source": "Employment Act 2007",
             "chapter": "Part III",
-            "section": "Section 45",
+            "section": section,
             "title": "Unfair termination",
             "chunkId": chunk_id,
             "pageImageKey": f"page-images/employment-act-2007/page-45.pdf",
@@ -211,14 +228,25 @@ class TestExtractCitations(unittest.TestCase):
         }
 
     def test_returns_citations_in_order(self):
-        refs = [self._ref("chunk-1"), self._ref("chunk-2")]
+        refs = [
+            self._ref("chunk-1", section="Section 40"),
+            self._ref("chunk-2", section="Section 45"),
+        ]
         result = extract_citations(self._rag_result(refs))
         self.assertEqual([c["chunkId"] for c in result], ["chunk-1", "chunk-2"])
 
-    def test_deduplicates_by_chunk_id(self):
-        refs = [self._ref("chunk-1"), self._ref("chunk-1"), self._ref("chunk-2")]
+    def test_deduplicates_sibling_chunks_of_same_section(self):
+        # splitToSegments can emit chunk-1 and chunk-1-2 for the same
+        # (source, section). Advanced RAG dedups them into one citation.
+        refs = [self._ref("chunk-1"), self._ref("chunk-1-2"), self._ref("chunk-2", section="Section 40")]
         result = extract_citations(self._rag_result(refs))
         self.assertEqual(len(result), 2)
+        self.assertEqual({c["section"] for c in result}, {"Section 45", "Section 40"})
+
+    def test_deduplicates_exact_duplicate_references(self):
+        refs = [self._ref("chunk-1"), self._ref("chunk-1")]
+        result = extract_citations(self._rag_result(refs))
+        self.assertEqual(len(result), 1)
 
     def test_page_image_url_included_when_key_and_s3_client_present(self):
         class _FakeS3:
@@ -709,7 +737,7 @@ class TestLambdaHandler(unittest.TestCase):
     """
 
     def setUp(self):
-        import handler as h
+        from app import handler as h
 
         self._orig_get_graph = h.get_compiled_graph
         self._orig_make_cw = h.make_cloudwatch
@@ -735,7 +763,7 @@ class TestLambdaHandler(unittest.TestCase):
         h.load_history = lambda config, session_id: self.history_payload
 
     def tearDown(self):
-        import handler as h
+        from app import handler as h
         h.get_compiled_graph = self._orig_get_graph
         h.make_cloudwatch = self._orig_make_cw
         h.load_history = self._orig_load_history
@@ -840,6 +868,683 @@ class TestLambdaHandler(unittest.TestCase):
         self.assertEqual(result["body"]["response"], BILINGUAL_REFUSAL)
 
 
+# ── Advanced RAG pipeline ─────────────────────────────────────────────────────
+
+def _catalog_entry(chunk_id: str, text: str, **meta) -> dict:
+    """Small helper for building in-memory catalog entries."""
+    m = {"chunkId": chunk_id, "source": "Employment Act 2007", "section": f"Section {chunk_id}"}
+    m.update(meta)
+    return {"chunkId": chunk_id, "text": text, "metadata": m}
+
+
+class TestQueryExpansion(unittest.TestCase):
+    """Parses the model\u2019s reply and handles failures gracefully."""
+
+    def test_parses_well_formed_json(self):
+        raw = '{"hypothetical": "An employer must give notice.", "decomposed": "What notice period applies?"}'
+        h, d = _parse_variants(raw)
+        self.assertEqual(h, "An employer must give notice.")
+        self.assertEqual(d, "What notice period applies?")
+
+    def test_strips_markdown_fences(self):
+        raw = '```json\n{"hypothetical": "foo", "decomposed": "bar"}\n```'
+        h, d = _parse_variants(raw)
+        self.assertEqual(h, "foo")
+        self.assertEqual(d, "bar")
+
+    def test_returns_none_on_malformed(self):
+        self.assertEqual(_parse_variants("not json"), (None, None))
+
+    def test_expand_query_falls_back_to_original_on_error(self):
+        class _Broken:
+            def invoke_model(self, **_):
+                raise RuntimeError("bedrock down")
+        out = expand_query("test query", _Broken(), "model")
+        self.assertEqual(out, ["test query"])
+
+    def test_expand_query_adds_two_variants(self):
+        br = _FakeBedrockRuntime(
+            text='{"hypothetical": "hypo answer", "decomposed": "sub question"}'
+        )
+        out = expand_query("original query", br, "model")
+        self.assertEqual(out, ["original query", "hypo answer", "sub question"])
+
+    def test_expand_query_dedupes_identical_variants(self):
+        br = _FakeBedrockRuntime(
+            text='{"hypothetical": "same", "decomposed": "Same"}'
+        )
+        out = expand_query("same", br, "model")
+        self.assertEqual(len(out), 1)
+
+
+class TestBM25Retrieve(unittest.TestCase):
+    """BM25 retriever over an in-memory catalog."""
+
+    def setUp(self):
+        bm25_module.reset_index()
+        # BM25Okapi\u2019s IDF goes to zero when a term appears in half the corpus,
+        # so we use a realistic set of 6 chunks where \"lease\" is distinctive
+        # to chunk-land and \"strike\" is distinctive to chunk-strike.
+        self.catalog = [
+            _catalog_entry("40", "An employer who terminates the employment shall give notice"),
+            _catalog_entry("45", "Unfair termination entitles the employee to compensation"),
+            _catalog_entry("10", "This Act applies to all employees in Kenya"),
+            _catalog_entry("20", "A contract of service for more than three months shall be in writing"),
+            _catalog_entry("land", "The tenant shall pay rent under a lease agreement with the landlord"),
+            _catalog_entry("strike", "Trade unions may call a strike after giving seven days notice"),
+        ]
+
+    def tearDown(self):
+        bm25_module.reset_index()
+
+    def test_retrieves_distinctive_term_first(self):
+        results = bm25_module.retrieve("lease agreement", self.catalog, top_k=3)
+        self.assertGreater(len(results), 0)
+        self.assertEqual(results[0]["metadata"]["chunkId"], "land")
+
+    def test_returns_empty_on_empty_query(self):
+        self.assertEqual(bm25_module.retrieve("", self.catalog), [])
+
+    def test_filter_restricts_corpus(self):
+        tagged = [
+            {**entry, "metadata": {**entry["metadata"], "chunkType": "toc"}}
+            if entry["chunkId"] == "strike"
+            else entry
+            for entry in self.catalog
+        ]
+        results = bm25_module.retrieve(
+            "strike notice",
+            tagged,
+            metadata_filter={"chunkType": "toc"},
+        )
+        self.assertTrue(all(r["metadata"].get("chunkType") == "toc" for r in results))
+        self.assertTrue(any(r["metadata"]["chunkId"] == "strike" for r in results))
+
+
+class TestRRF(unittest.TestCase):
+
+    def _r(self, chunk_id: str, score: float = 0.0) -> dict:
+        return {
+            "content": {"text": chunk_id},
+            "metadata": {"chunkId": chunk_id},
+            "score": score,
+        }
+
+    def test_single_list_preserves_order(self):
+        fused = rag_rrf.fuse([[self._r("a"), self._r("b"), self._r("c")]])
+        self.assertEqual([r["metadata"]["chunkId"] for r in fused], ["a", "b", "c"])
+
+    def test_fuses_two_lists_boosts_overlap(self):
+        # "a" appears at rank 1 in both lists; "b" only at rank 1 in one.
+        fused = rag_rrf.fuse([
+            [self._r("a"), self._r("b"), self._r("c")],
+            [self._r("a"), self._r("d"), self._r("e")],
+        ])
+        self.assertEqual(fused[0]["metadata"]["chunkId"], "a")
+        self.assertGreater(len(fused), 3)
+
+    def test_empty_input_returns_empty(self):
+        self.assertEqual(rag_rrf.fuse([]), [])
+
+
+class TestFilters(unittest.TestCase):
+
+    def _entry(self, **meta) -> dict:
+        return {"metadata": meta}
+
+    def test_drop_toc_removes_explicit_chunktype(self):
+        results = [
+            self._entry(chunkType="body", section="Section 40"),
+            self._entry(chunkType="toc", section="Arrangement"),
+        ]
+        self.assertEqual(len(rag_filters.drop_toc(results)), 1)
+
+    def test_drop_toc_removes_heuristic_match(self):
+        results = [
+            self._entry(section="Arrangement of Sections", title=""),
+            self._entry(section="Section 40", title="Termination"),
+        ]
+        kept = rag_filters.drop_toc(results)
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(kept[0]["metadata"]["section"], "Section 40")
+
+    def test_dedup_by_section_keeps_first(self):
+        results = [
+            self._entry(source="X", section="S1", chunkId="a"),
+            self._entry(source="X", section="S1", chunkId="b"),
+            self._entry(source="X", section="S2", chunkId="c"),
+        ]
+        out = rag_filters.dedup_by_section(results)
+        self.assertEqual([r["metadata"]["chunkId"] for r in out], ["a", "c"])
+
+
+class _StubAdapter:
+    """
+    In-memory adapter used to drive the RAG pipeline without AWS. Implements
+    the subset of the RAGAdapterLike protocol the pipeline touches.
+    """
+
+    def __init__(self, dense_results: list[dict], generated_text: str, stop_reason: str = "end_turn"):
+        self._dense = dense_results
+        self._text = generated_text
+        self._stop_reason = stop_reason
+        self.retrieve_calls: list[tuple[str, int, dict | None]] = []
+        self.generate_calls: list[dict] = []
+
+    @property
+    def catalog_s3_client(self):
+        return None
+
+    @property
+    def catalog_bucket(self) -> str:
+        return "haki-ai-data"
+
+    @property
+    def bedrock_runtime(self):
+        return _FakeBedrockRuntime(text='{"hypothetical": "", "decomposed": ""}')
+
+    @property
+    def bedrock_agent_runtime(self):
+        class _NoRerank:
+            def rerank(self, **_):
+                raise RuntimeError("no rerank in test")
+        return _NoRerank()
+
+    @property
+    def aws_region(self) -> str:
+        return "us-east-1"
+
+    def retrieve(self, query, top_k=30, metadata_filter=None):
+        self.retrieve_calls.append((query, top_k, metadata_filter))
+        return [dict(r) for r in self._dense]
+
+    def generate(self, query, system_prompt, context, model_id):
+        self.generate_calls.append({
+            "query": query,
+            "system": system_prompt,
+            "context": context,
+            "model": model_id,
+        })
+        return self._text, self._stop_reason
+
+
+class TestRunRag(unittest.TestCase):
+    """End-to-end pipeline wiring against a stub adapter and prebuilt catalog."""
+
+    def setUp(self):
+        bm25_module.reset_index()
+        catalog_module.reset_catalog()
+        catalog_module.set_catalog(
+            [_catalog_entry("40", "Notice termination employment")],
+            bucket="haki-ai-data",
+        )
+
+    def tearDown(self):
+        catalog_module.reset_catalog()
+        bm25_module.reset_index()
+
+    def _dense_result(self, chunk_id: str) -> dict:
+        return {
+            "content": {"text": f"body for {chunk_id}"},
+            "metadata": {
+                "source": "Employment Act 2007",
+                "section": f"Section {chunk_id}",
+                "chunkId": chunk_id,
+                "chunkType": "body",
+            },
+            "location": {
+                "type": "S3",
+                "s3Location": {"uri": f"s3://bucket/processed-chunks/{chunk_id}.txt"},
+            },
+            "score": 0.9,
+        }
+
+    def test_returns_retrieve_and_generate_shape(self):
+        adapter = _StubAdapter(
+            dense_results=[self._dense_result("40")],
+            generated_text="Here is your answer.",
+        )
+        result = run_rag("What is Section 40?", "system", "model", adapter)
+        self.assertEqual(result["output"]["text"], "Here is your answer.")
+        self.assertEqual(result["stopReason"], "end_turn")
+        self.assertIn("citations", result)
+        refs = result["citations"][0]["retrievedReferences"]
+        self.assertGreaterEqual(len(refs), 1)
+        self.assertEqual(refs[0]["metadata"]["chunkId"], "40")
+
+    def test_propagates_guardrail_stop_reason(self):
+        adapter = _StubAdapter(
+            dense_results=[self._dense_result("40")],
+            generated_text="",
+            stop_reason="guardrail_intervened",
+        )
+        result = run_rag("blocked?", "system", "model", adapter)
+        self.assertEqual(result["stopReason"], "guardrail_intervened")
+        self.assertTrue(check_guardrail_block(result))
+
+    def test_filters_toc_before_generation(self):
+        toc = self._dense_result("toc")
+        toc["metadata"]["chunkType"] = "toc"
+        toc["metadata"]["section"] = "Arrangement of Sections"
+        adapter = _StubAdapter(
+            dense_results=[toc, self._dense_result("40")],
+            generated_text="ok",
+        )
+        result = run_rag("help", "system", "model", adapter)
+        refs = result["citations"][0]["retrievedReferences"]
+        # Neither the retrieved refs nor the context should contain TOC.
+        chunk_ids = [r["metadata"]["chunkId"] for r in refs]
+        self.assertNotIn("toc", chunk_ids)
+        self.assertIn("body for 40", adapter.generate_calls[-1]["context"])
+
+
+# ── Supervisor router ─────────────────────────────────────────────────────────
+
+class TestSupervisorParsing(unittest.TestCase):
+
+    def test_parses_single_agent(self):
+        agents, reason = _parse_routing('{"agents": ["employment"], "reason": "notice"}')
+        self.assertEqual(agents, ["employment"])
+        self.assertEqual(reason, "notice")
+
+    def test_parses_multiple_agents(self):
+        agents, _ = _parse_routing('{"agents": ["land", "faq"], "reason": "eviction + procedure"}')
+        self.assertEqual(agents, ["land", "faq"])
+
+    def test_chat_is_exclusive(self):
+        agents, _ = _parse_routing('{"agents": ["chat", "employment"]}')
+        self.assertEqual(agents, ["chat"])
+
+    def test_drops_unknown_agents(self):
+        agents, _ = _parse_routing('{"agents": ["employment", "tax", "land"]}')
+        self.assertEqual(agents, ["employment", "land"])
+
+    def test_caps_at_three_agents(self):
+        agents, _ = _parse_routing(
+            '{"agents": ["constitution", "employment", "land", "faq"]}'
+        )
+        self.assertEqual(len(agents), 3)
+
+    def test_malformed_json_falls_back(self):
+        agents, _ = _parse_routing("not json at all")
+        self.assertEqual(agents, ["employment"])
+
+    def test_empty_agents_falls_back(self):
+        agents, _ = _parse_routing('{"agents": []}')
+        self.assertEqual(agents, ["employment"])
+
+
+class TestRouteSupervisor(unittest.TestCase):
+
+    def test_happy_path_calls_bedrock(self):
+        br = _FakeBedrockRuntime(text='{"agents": ["employment"], "reason": "notice"}')
+        agents, reason = route_supervisor(
+            [{"role": "user", "content": "What notice am I owed?"}],
+            br,
+            "haiku",
+        )
+        self.assertEqual(agents, ["employment"])
+        self.assertEqual(reason, "notice")
+
+    def test_falls_back_on_bedrock_error(self):
+        class _Broken:
+            def invoke_model(self, **_):
+                raise RuntimeError("throttled")
+        agents, reason = route_supervisor(
+            [{"role": "user", "content": "hi"}],
+            _Broken(),
+            "haiku",
+        )
+        self.assertEqual(agents, ["employment"])
+        self.assertEqual(reason, "bedrock_error")
+
+
+# ── Synthesizer ───────────────────────────────────────────────────────────────
+
+class TestSynthesizer(unittest.TestCase):
+
+    def _output(self, agent: str, *, text="answer", citations=None, blocked=False) -> dict:
+        return {"agent": agent, "text": text, "citations": citations or [], "blocked": blocked}
+
+    def test_single_output_passthrough_no_llm_call(self):
+        class _FailIfCalled:
+            def invoke_model(self, **_):
+                raise AssertionError("synthesizer should not call LLM for single output")
+        out = synthesize(
+            [self._output("employment", text="The Act says X.")],
+            "english",
+            _FailIfCalled(),
+            "haiku",
+        )
+        self.assertEqual(out["text"], "The Act says X.")
+        self.assertFalse(out["blocked"])
+
+    def test_blocked_specialist_shortcircuits(self):
+        class _FailIfCalled:
+            def invoke_model(self, **_):
+                raise AssertionError("synthesizer should not call LLM on blocked output")
+        out = synthesize(
+            [
+                self._output("employment", text="answer", citations=[]),
+                self._output("land", text="REFUSED", blocked=True),
+            ],
+            "english",
+            _FailIfCalled(),
+            "haiku",
+        )
+        self.assertTrue(out["blocked"])
+        self.assertEqual(out["text"], "REFUSED")
+
+    def test_multi_specialist_calls_llm_and_dedups_citations(self):
+        br = _FakeBedrockRuntime(text="Merged answer referencing both statutes.")
+        outputs = [
+            self._output("employment", text="Employment answer", citations=[
+                {"source": "Employment Act 2007", "section": "Section 40"}
+            ]),
+            self._output("land", text="Land answer", citations=[
+                {"source": "Land Act 2012", "section": "Section 152"},
+                # Duplicate of first specialist's citation (cross-reference).
+                {"source": "Employment Act 2007", "section": "Section 40"},
+            ]),
+        ]
+        out = synthesize(outputs, "english", br, "haiku")
+        self.assertEqual(out["text"], "Merged answer referencing both statutes.")
+        self.assertEqual(len(out["citations"]), 2)
+        sections = {c["section"] for c in out["citations"]}
+        self.assertEqual(sections, {"Section 40", "Section 152"})
+
+    def test_empty_outputs_returns_blocked(self):
+        out = synthesize([], "english", _FakeBedrockRuntime(text=""), "haiku")
+        self.assertTrue(out["blocked"])
+
+
+class TestDedupCitations(unittest.TestCase):
+
+    def test_dedups_across_lists(self):
+        a = [{"source": "X", "section": "S1", "chunkId": "a"}]
+        b = [{"source": "X", "section": "S1", "chunkId": "b"}]
+        self.assertEqual(len(_dedup_citations([a, b])), 1)
+
+    def test_falls_back_to_chunkid_when_fields_missing(self):
+        a = [{"chunkId": "a"}]
+        b = [{"chunkId": "b"}, {"chunkId": "a"}]
+        self.assertEqual(len(_dedup_citations([a, b])), 2)
+
+
+# ── Evals: golden set ─────────────────────────────────────────────────────────
+
+class TestGoldenSet(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        cls.cases = load_golden_set()
+
+    def test_has_thirty_cases(self):
+        self.assertEqual(len(self.cases), 30)
+
+    def test_has_ten_per_category(self):
+        counts: dict[str, int] = {}
+        for c in self.cases:
+            counts[c.category] = counts.get(c.category, 0) + 1
+        self.assertEqual(counts.get("constitution"), 10)
+        self.assertEqual(counts.get("employment"), 10)
+        self.assertEqual(counts.get("land"), 10)
+
+    def test_has_at_least_ten_non_english_cases(self):
+        non_english = [c for c in self.cases if c.language != "english"]
+        self.assertGreaterEqual(len(non_english), 10)
+
+    def test_case_ids_are_unique(self):
+        ids = [c.id for c in self.cases]
+        self.assertEqual(len(ids), len(set(ids)))
+
+    def test_every_case_has_an_expected_source(self):
+        for c in self.cases:
+            self.assertGreater(len(c.expected_sources), 0, c.id)
+
+
+# ── Evals: judge response parsing ─────────────────────────────────────────────
+
+class TestJudgeParsing(unittest.TestCase):
+
+    def test_parses_well_formed_scores(self):
+        text = (
+            'Here: {"accuracy": 4, "citation_correctness": 5, '
+            '"tone": 3, "language_appropriateness": 5, '
+            '"notes": "good"}'
+        )
+        score = _parse_judge_response(text)
+        self.assertEqual(score.accuracy, 4)
+        self.assertEqual(score.citation_correctness, 5)
+        self.assertEqual(score.tone, 3)
+        self.assertEqual(score.language_appropriateness, 5)
+        self.assertEqual(score.notes, "good")
+
+    def test_clamps_out_of_range(self):
+        score = _parse_judge_response(
+            '{"accuracy": 9, "citation_correctness": -2, '
+            '"tone": 3, "language_appropriateness": 5}'
+        )
+        self.assertEqual(score.accuracy, 5)
+        self.assertEqual(score.citation_correctness, 0)
+
+    def test_missing_axes_default_to_zero(self):
+        score = _parse_judge_response('{"accuracy": 4}')
+        self.assertEqual(score.accuracy, 4)
+        self.assertEqual(score.citation_correctness, 0)
+
+    def test_malformed_returns_zero_with_note(self):
+        score = _parse_judge_response("not json")
+        self.assertEqual(score.accuracy, 0)
+        self.assertIn("parse_failure", score.notes)
+
+    def test_mean_is_average_over_four_axes(self):
+        score = _parse_judge_response(
+            '{"accuracy": 4, "citation_correctness": 4, "tone": 4, "language_appropriateness": 4}'
+        )
+        self.assertAlmostEqual(score.mean(), 4.0)
+
+
+class TestJudgeBedrockErrors(unittest.TestCase):
+
+    def test_returns_zero_on_bedrock_error(self):
+        class _Broken:
+            def invoke_model(self, **_):
+                raise RuntimeError("boom")
+        score = judge(
+            question="q",
+            language="english",
+            candidate_answer="a",
+            candidate_citations=[],
+            reference_answer="r",
+            expected_sources=["Employment Act 2007"],
+            retrieved_contexts=[],
+            bedrock_runtime=_Broken(),
+            model_id="haiku",
+        )
+        self.assertEqual(score.accuracy, 0)
+        self.assertTrue(score.notes.startswith("bedrock_error"))
+
+    def test_happy_path_invokes_bedrock(self):
+        br = _FakeBedrockRuntime(
+            text='{"accuracy": 5, "citation_correctness": 4, "tone": 5, "language_appropriateness": 5}'
+        )
+        score = judge(
+            question="What is Section 40?",
+            language="english",
+            candidate_answer="Redundancy rules.",
+            candidate_citations=[{"source": "Employment Act 2007", "section": "Section 40"}],
+            reference_answer="Section 40 governs redundancy.",
+            expected_sources=["Employment Act 2007"],
+            retrieved_contexts=["ctx"],
+            bedrock_runtime=br,
+            model_id="haiku",
+        )
+        self.assertEqual(score.accuracy, 5)
+        self.assertEqual(score.language_appropriateness, 5)
+
+
+# ── Evals: report writer ──────────────────────────────────────────────────────
+
+class TestReportWriter(unittest.TestCase):
+
+    def _make_case_score(self, category: str, *, scores: tuple[int, int, int, int]) -> CaseScore:
+        from evals.loader import GoldenCase
+        from evals.llm_judge import JudgeScore
+        from evals.runner import EvalResult
+
+        case = GoldenCase(
+            id=f"{category}-test",
+            category=category,
+            question="Q?",
+            reference_answer="R.",
+            expected_sources=["Source"],
+            expected_sections=[],
+            language="english",
+        )
+        result = EvalResult(
+            case=case,
+            answer="A",
+            citations=[{"source": "Source", "section": "Section 40"}],
+            retrieved_contexts=["ctx"],
+        )
+        judge_score = JudgeScore(
+            accuracy=scores[0],
+            citation_correctness=scores[1],
+            tone=scores[2],
+            language_appropriateness=scores[3],
+            notes="ok",
+        )
+        return CaseScore(result=result, judge=judge_score)
+
+    def test_aggregate_judge_averages_per_axis(self):
+        from evals.llm_judge import JudgeScore
+        scores = [
+            JudgeScore(accuracy=5, citation_correctness=3, tone=4, language_appropriateness=5),
+            JudgeScore(accuracy=3, citation_correctness=5, tone=4, language_appropriateness=3),
+        ]
+        agg = _aggregate_judge(scores)
+        self.assertAlmostEqual(agg["accuracy"], 4.0)
+        self.assertAlmostEqual(agg["citation_correctness"], 4.0)
+        self.assertAlmostEqual(agg["tone"], 4.0)
+        self.assertAlmostEqual(agg["language_appropriateness"], 4.0)
+
+    def test_overall_mean_averages_axes(self):
+        agg = {axis: 4.0 for axis in AXES}
+        self.assertAlmostEqual(_overall_mean(agg), 4.0)
+
+    def test_category_breakdown(self):
+        case_scores = [
+            self._make_case_score("constitution", scores=(5, 5, 5, 5)),
+            self._make_case_score("constitution", scores=(3, 3, 3, 3)),
+            self._make_case_score("employment", scores=(4, 4, 4, 4)),
+        ]
+        breakdown = _category_breakdown(case_scores)
+        self.assertAlmostEqual(breakdown["constitution"]["accuracy"], 4.0)
+        self.assertAlmostEqual(breakdown["employment"]["accuracy"], 4.0)
+
+    def test_write_report_creates_markdown(self):
+        import tempfile
+
+        case_scores = [self._make_case_score("employment", scores=(5, 4, 3, 5))]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write_report(case_scores, ragas=None, out_dir=tmp)
+            self.assertTrue(os.path.exists(path))
+            with open(path, "r", encoding="utf-8") as f:
+                body = f.read()
+        self.assertIn("Haki AI", body)
+        self.assertIn("employment", body)
+        self.assertIn("Section", body)  # citation rendered
+        self.assertIn("Overall (0–5)", body)
+
+    def test_write_report_includes_ragas_section(self):
+        import tempfile
+
+        case_scores = [self._make_case_score("land", scores=(4, 4, 4, 4))]
+        ragas = {
+            "faithfulness": 0.8,
+            "answer_relevancy": 0.7,
+            "context_precision": 0.9,
+            "context_recall": 0.6,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write_report(case_scores, ragas=ragas, out_dir=tmp)
+            with open(path, "r", encoding="utf-8") as f:
+                body = f.read()
+        self.assertIn("RAGAS metrics", body)
+        self.assertIn("faithfulness", body)
+
+
+class TestSageMakerGenerator(unittest.TestCase):
+    """Phase 4b — fine-tuned Llama endpoint invocation + Bedrock fallback."""
+
+    def test_generate_returns_end_turn_on_normal_response(self):
+        from rag.sagemaker_generator import generate
+
+        class _Rt:
+            def __init__(self):
+                self.last_call = None
+
+            def invoke_endpoint(self, **kwargs):
+                self.last_call = kwargs
+                payload = [{"generated_text": "Yes, under Section 40."}]
+                return {"Body": io.BytesIO(json.dumps(payload).encode())}
+
+        rt = _Rt()
+        text, stop = generate(
+            query="Is notice required?",
+            system_prompt="You are Haki AI.",
+            context="Section 40 of the Employment Act ...",
+            endpoint_name="haki-ai-finetuned",
+            sagemaker_runtime=rt,
+        )
+        self.assertEqual(text, "Yes, under Section 40.")
+        self.assertEqual(stop, "end_turn")
+        self.assertEqual(rt.last_call["EndpointName"], "haki-ai-finetuned")
+        body = json.loads(rt.last_call["Body"])
+        self.assertIn("<|start_header_id|>user<|end_header_id|>", body["inputs"])
+        self.assertIn("<context>", body["inputs"])
+
+    def test_bedrock_adapter_falls_back_on_sagemaker_error(self):
+        from clients.adapters import BedrockRAGAdapter
+
+        class _FakeConfig:
+            use_finetuned_model = True
+            sagemaker_endpoint_name = "haki-ai-finetuned"
+            guardrail_id = ""
+            guardrail_version = ""
+            knowledge_base_id = ""
+            aws_region = "us-east-1"
+            s3_bucket = "b"
+
+        class _SmRuntime:
+            def invoke_endpoint(self, **_):
+                raise RuntimeError("cold start timeout")
+
+        fallback_hits = []
+
+        class _BedrockRuntime:
+            def invoke_model(self, **kwargs):
+                fallback_hits.append(kwargs)
+                payload = {"content": [{"text": "fallback answer"}], "stop_reason": "end_turn"}
+                return {"body": io.BytesIO(json.dumps(payload).encode())}
+
+        adapter = BedrockRAGAdapter(
+            bedrock_agent_runtime=object(),
+            bedrock_runtime=_BedrockRuntime(),
+            config=_FakeConfig(),
+            s3_client=object(),
+            sagemaker_runtime=_SmRuntime(),
+        )
+
+        text, stop = adapter.generate(
+            query="q", system_prompt="s", context="c", model_id="claude-haiku"
+        )
+        self.assertEqual(text, "fallback answer")
+        self.assertEqual(stop, "end_turn")
+        self.assertEqual(len(fallback_hits), 1)
+
+
 # ── Runner ────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -860,6 +1565,11 @@ if __name__ == "__main__":
         TestBootstrapLangsmith,
         TestTraceMetadata,
         TestLambdaHandler,
+        TestQueryExpansion,
+        TestBM25Retrieve,
+        TestRRF,
+        TestFilters,
+        TestRunRag,
     ]:
         suite.addTests(loader.loadTestsFromTestCase(cls))
 
