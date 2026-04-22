@@ -81,6 +81,23 @@ resource "aws_cloudwatch_metric_alarm" "guardrail_blocks" {
   alarm_actions       = [aws_sns_topic.alerts.arn]
 }
 
+# Eval score regression — the nightly/on-PR eval job emits a single
+# HakiAI/EvalScore metric on a 0-5 scale (see backend/evals/report.py).
+# Any drop below 3.5 is considered a rubric regression.
+resource "aws_cloudwatch_metric_alarm" "eval_score" {
+  alarm_name          = "${var.project_name}-eval-score-regression"
+  alarm_description   = "Eval LLM-judge score dropped below 3.5/5"
+  namespace           = "HakiAI"
+  metric_name         = "EvalScore"
+  comparison_operator = "LessThanThreshold"
+  evaluation_periods  = 1
+  period              = 86400
+  statistic           = "Minimum"
+  threshold           = 3.5
+  treat_missing_data  = "notBreaching"
+  alarm_actions       = [aws_sns_topic.alerts.arn]
+}
+
 # Lambda errors (from Lambda's own metrics — catches crashes before handler runs)
 resource "aws_cloudwatch_metric_alarm" "lambda_errors" {
   alarm_name          = "${var.project_name}-lambda-errors"
@@ -186,6 +203,24 @@ resource "aws_cloudwatch_dashboard" "main" {
           ]
           period = 3600
           view   = "timeSeries"
+        }
+      },
+      {
+        type   = "metric"
+        x      = 0
+        y      = 12
+        width  = 24
+        height = 6
+        properties = {
+          title  = "Eval Score (LLM-judge mean, 0-5)"
+          region = "us-east-1"
+          metrics = [
+            ["HakiAI", "EvalScore", { stat = "Average", label = "Mean" }],
+            ["HakiAI", "EvalScore", { stat = "Minimum", label = "Min", color = "#d62728" }],
+          ]
+          period = 86400
+          view   = "timeSeries"
+          yAxis  = { left = { min = 0, max = 5 } }
         }
       },
     ]
