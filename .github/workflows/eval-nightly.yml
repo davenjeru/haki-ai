@@ -1,0 +1,85 @@
+name: Nightly evals
+
+# Runs the full RAGAS + LLM-judge eval suite against the prod KB every
+# night at 02:00 UTC, then posts the markdown report as a commit comment
+# on main so regressions surface without anyone needing to open the
+# Actions tab.
+
+on:
+  schedule:
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  eval:
+    name: RAGAS + LLM-judge
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+
+      - name: Sync backend deps (incl. optional `evals` group)
+        working-directory: backend
+        run: uv sync --group evals
+
+      - name: Run evaluation
+        working-directory: backend
+        env:
+          ENV: prod
+          BEDROCK_MODEL_ID: ${{ vars.BEDROCK_MODEL_ID }}
+          KNOWLEDGE_BASE_ID: ${{ vars.KNOWLEDGE_BASE_ID }}
+          S3_BUCKET: ${{ vars.S3_BUCKET }}
+        run: uv run python -m evals.run --with-ragas
+
+      - name: Upload report
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-report
+          path: backend/evals/reports/*.md
+          if-no-files-found: warn
+
+      - name: Comment on latest main commit
+        if: github.ref == 'refs/heads/main'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const reportsDir = 'backend/evals/reports';
+            if (!fs.existsSync(reportsDir)) {
+              core.info('No reports directory produced; skipping comment.');
+              return;
+            }
+            const latest = fs.readdirSync(reportsDir)
+              .filter((f) => f.endsWith('.md'))
+              .sort()
+              .pop();
+            if (!latest) {
+              core.info('No report generated; skipping comment.');
+              return;
+            }
+            const body = fs.readFileSync(path.join(reportsDir, latest), 'utf8');
+            const { data: commits } = await github.rest.repos.listCommits({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: 'main',
+              per_page: 1,
+            });
+            await github.rest.repos.createCommitComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              commit_sha: commits[0].sha,
+              body: `## Nightly eval — ${latest}\n\n${body}`,
+            });

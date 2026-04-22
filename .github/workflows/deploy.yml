@@ -1,0 +1,152 @@
+name: Deploy
+
+# Deploys Haki AI to prod on every push to `main`. Split into three
+# jobs so a failure in any stage fails fast without leaving the system
+# in a half-upgraded state:
+#   1. terraform — applies infra changes (IAM, Lambda zip, KB, etc.)
+#   2. web       — builds and syncs the Vite SPA + invalidates CloudFront
+#   3. pipeline  — detects net-new PDFs in data/raw and ingests them
+#
+# Requires the following to be configured once in the GitHub repo:
+#   - Secret:  LANGSMITH_API_KEY           (only if tracing is enabled)
+#   - Variable: AWS_ROLE_TO_ASSUME         (arn:aws:iam::<acct>:role/haki-ai-github)
+#                                          OIDC-federated role trusting
+#                                          this repo's main branch
+#   - Variable: AWS_REGION                 (us-east-1)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  terraform:
+    name: terraform apply
+    runs-on: ubuntu-latest
+    environment: production
+    outputs:
+      web_bucket: ${{ steps.out.outputs.web_bucket }}
+      web_distribution_id: ${{ steps.out.outputs.web_distribution_id }}
+      data_bucket: ${{ steps.out.outputs.data_bucket }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '1.9.0'
+
+      - name: Install uv (for Lambda layer build)
+        uses: astral-sh/setup-uv@v3
+
+      - name: Terraform init
+        working-directory: infra
+        run: terraform init
+
+      - name: Terraform apply
+        working-directory: infra
+        env:
+          TF_VAR_langsmith_api_key: ${{ secrets.LANGSMITH_API_KEY }}
+        run: terraform apply -auto-approve
+
+      - name: Capture outputs
+        id: out
+        working-directory: infra
+        run: |
+          echo "web_bucket=$(terraform output -raw web_bucket)" >> "$GITHUB_OUTPUT"
+          echo "web_distribution_id=$(terraform output -raw web_distribution_id)" >> "$GITHUB_OUTPUT"
+          echo "data_bucket=$(terraform output -raw data_bucket_id)" >> "$GITHUB_OUTPUT"
+
+  web:
+    name: deploy web
+    needs: terraform
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build SPA
+        working-directory: frontend
+        run: |
+          npm ci --prefer-offline --no-audit
+          npm run build
+
+      - name: Sync to S3 + invalidate CloudFront
+        env:
+          BUCKET: ${{ needs.terraform.outputs.web_bucket }}
+          DIST: ${{ needs.terraform.outputs.web_distribution_id }}
+        working-directory: frontend
+        run: |
+          aws s3 sync dist/ "s3://$BUCKET/" --delete --only-show-errors \
+            --cache-control "public, max-age=31536000, immutable" \
+            --exclude 'index.html' --exclude '*.html'
+          aws s3 sync dist/ "s3://$BUCKET/" --only-show-errors \
+            --cache-control "public, max-age=0, must-revalidate" \
+            --exclude '*' --include '*.html'
+          aws cloudfront create-invalidation --distribution-id "$DIST" --paths '/*' \
+            --query 'Invalidation.Id' --output text
+
+  pipeline:
+    name: ingest net-new statutes
+    needs: terraform
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: pipeline/package-lock.json
+
+      - name: Install
+        working-directory: pipeline
+        run: npm ci --prefer-offline --no-audit
+
+      - name: Diff data/raw against S3 and ingest new PDFs
+        env:
+          DATA_BUCKET: ${{ needs.terraform.outputs.data_bucket }}
+        run: |
+          set -euo pipefail
+          NEW_PDFS=$(comm -23 \
+            <(ls data/raw/*.pdf 2>/dev/null | xargs -n1 basename | sort) \
+            <(aws s3 ls "s3://$DATA_BUCKET/raw/" | awk '{print $4}' | sort))
+          if [ -z "${NEW_PDFS:-}" ]; then
+            echo "[pipeline] no net-new PDFs"
+            exit 0
+          fi
+          echo "[pipeline] new PDFs: $NEW_PDFS"
+          cd pipeline
+          npm run dev
+          # The S3 EventBridge → ingestion_trigger Lambda takes it from here
+          # (see infra/modules/compute/ingestion_trigger.tf).

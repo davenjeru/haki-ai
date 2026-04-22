@@ -1,0 +1,111 @@
+name: CI
+
+# Runs on every PR. Keeps Haki AI demoable:
+#   - backend unit tests (fast, no AWS)
+#   - frontend typecheck + build
+#   - pipeline typecheck + crawler extraction test
+#   - terraform validate for infra
+#
+# The full evaluation harness (RAGAS + LLM-judge) runs on the nightly
+# schedule — see eval-nightly.yml — because it needs Bedrock credentials
+# and a live KB.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Backend (Python)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+
+      - name: Sync deps
+        working-directory: backend
+        run: uv sync
+
+      - name: Unit tests
+        working-directory: backend
+        run: uv run python -m unittest discover -s tests -p 'test_unit.py' -v
+
+  frontend:
+    name: Frontend (Vite + TS)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install
+        working-directory: frontend
+        run: npm ci --prefer-offline --no-audit
+
+      - name: Typecheck
+        working-directory: frontend
+        run: npx tsc --noEmit
+
+      - name: Build
+        working-directory: frontend
+        run: npm run build
+
+  pipeline:
+    name: Pipeline (Node)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: pipeline/package-lock.json
+
+      - name: Install
+        working-directory: pipeline
+        run: npm ci --prefer-offline --no-audit
+
+      - name: Typecheck
+        working-directory: pipeline
+        run: npm run typecheck
+
+      - name: Test (crawler snapshots)
+        working-directory: pipeline
+        run: npm test
+
+  infra:
+    name: Terraform
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '1.9.0'
+
+      - name: Format check
+        working-directory: infra
+        run: terraform fmt -check -recursive
+
+      - name: Init (no backend)
+        working-directory: infra
+        run: terraform init -backend=false
+
+      - name: Validate
+        working-directory: infra
+        run: terraform validate
