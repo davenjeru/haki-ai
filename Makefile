@@ -16,7 +16,7 @@ SHELL := /usr/bin/env bash
 REPO_ROOT := $(shell pwd)
 
 .PHONY: help setup deps env bootstrap local-apply dev backend-dev frontend-dev \
-        pipeline-dev ingest-local test eval clean check-tools
+        pipeline-dev ingest-local ingest-web crawl test eval audit clean check-tools
 
 help:
 	@echo "Haki AI — common targets:"
@@ -24,7 +24,10 @@ help:
 	@echo "  make dev            Run the full local stack (LocalStack + backend + frontend)."
 	@echo "  make test           Run backend + frontend + pipeline tests."
 	@echo "  make eval           Run the RAG evaluation harness against the golden set."
-	@echo "  make ingest-local   Ingest processed chunks into the local ChromaDB collection."
+	@echo "  make audit CATEGORY=land   Per-case retrieval triage (hit / noise / rerank-loss)."
+	@echo "  make ingest-local   Ingest statute chunks (processed-chunks/) into local ChromaDB."
+	@echo "  make ingest-web     Ingest crawled web sources (faq-chunks/) into local ChromaDB."
+	@echo "  make crawl LIMIT=200   Crawl SheriaPlex forum threads into LocalStack S3."
 	@echo ""
 	@echo "One-off plumbing:"
 	@echo "  make deps           Install backend/pipeline/frontend dependencies."
@@ -105,6 +108,21 @@ pipeline-dev:
 ingest-local:
 	cd backend && uv run python -m app.ingest_local
 
+# Ingest crawled web sources (SheriaPlex FAQs today; future KenyaLaw
+# summaries tomorrow) into the same ChromaDB collection as statutes,
+# tagged corpus="faq" so the FAQAgent can filter on it. Pass PREFIX=...
+# to target a different crawled corpus.
+ingest-web:
+	cd backend && uv run python -m app.ingest_from_web_sources \
+	  $(if $(PREFIX),--prefix $(PREFIX))
+
+# Crawl SheriaPlex forum threads into s3://<bucket>/faq-chunks/.
+# Safe defaults: 1.5s delay between requests + a hard LIMIT cap (default
+# 40 via the script, override with LIMIT=200 to cover every thread
+# discoverable from the forum index).
+crawl:
+	cd pipeline && npm run crawl -- $(if $(LIMIT),--limit $(LIMIT))
+
 # ── Tests + evals ────────────────────────────────────────────────────────────
 
 test:
@@ -114,6 +132,18 @@ test:
 
 eval:
 	cd backend && uv run python -m evals.run
+
+# Per-case retrieval audit — re-runs the pipeline for one category and
+# classifies each top-5 as hit / noise-pollution / rerank-loss. Used to
+# decide whether a retrieval regression is a chunker / filter bug or a
+# genuine embedding-coverage gap. Set CATEGORY=<name> to narrow scope.
+#
+#   make audit CATEGORY=land
+#   make audit CATEGORY=tenant TOP_K=10
+audit:
+	cd backend && uv run python -m evals.audit \
+	  $(if $(CATEGORY),--category $(CATEGORY)) \
+	  $(if $(TOP_K),--top-k $(TOP_K))
 
 # ── Housekeeping ─────────────────────────────────────────────────────────────
 
