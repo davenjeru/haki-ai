@@ -12,7 +12,7 @@
     "chunk:local": "AWS_ENDPOINT_URL=http://localhost:4566 tsx src/chunk-laws.ts",
     "crawl": "tsx src/crawl-sheriaplex.ts",
     "crawl:dry": "tsx src/crawl-sheriaplex.ts -- --dry-run",
-    "test": "tsx src/crawl-sheriaplex.test.ts",
+    "test": "tsx src/crawl-sheriaplex.test.ts && tsx src/assemble.test.ts",
     "typecheck": "tsc --noEmit",
     "local:start": "localstack start -d",
     "local:stop": "localstack stop"

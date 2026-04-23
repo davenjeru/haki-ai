@@ -26,7 +26,17 @@ export interface LawConfig {
   structure: LawStructure;
 }
 
-export const LAWS: LawConfig[] = [
+// Optional comma-separated allowlist of shortIds, e.g.
+//   LAW_IDS=landlord-and-tenant-act-cap-301,law-of-contract-act
+// Useful for smoke-testing new corpus additions before paying LiteParse
+// OCR costs on the big statutes (Penal Code, Criminal Procedure Code).
+const _LAW_IDS_FILTER: string[] | null = (() => {
+  const raw = (process.env.LAW_IDS ?? "").trim();
+  if (!raw) return null;
+  return raw.split(",").map((s) => s.trim()).filter(Boolean);
+})();
+
+const _ALL_LAWS: LawConfig[] = [
   {
     name: "Constitution of Kenya 2010",
     shortId: "constitution-2010",
@@ -45,4 +55,57 @@ export const LAWS: LawConfig[] = [
     filename: "land-act-2012.pdf",
     structure: "act",
   },
+  // ── Corpus expansion (Tier 1: high query volume, low overlap) ──────────────
+  {
+    name: "Law of Contract Act",
+    shortId: "law-of-contract-act",
+    filename: "law-of-contract-act.pdf",
+    structure: "act",
+  },
+  {
+    name: "Marriage Act 2014",
+    shortId: "marriage-act-2014",
+    filename: "marriage-act-2022.pdf",
+    structure: "act",
+  },
+  {
+    name: "Penal Code (Cap. 63)",
+    shortId: "penal-code-cap-63",
+    filename: "penal-code-cap-63.pdf",
+    structure: "act",
+  },
+  {
+    name: "Criminal Procedure Code (Cap. 75)",
+    shortId: "criminal-procedure-code-cap-75",
+    filename: "criminal-procedure-code-cap-75.pdf",
+    structure: "act",
+  },
+  {
+    name: "Children Act 2022",
+    shortId: "children-act-2022",
+    filename: "children-act-2022.pdf",
+    structure: "act",
+  },
+  {
+    name: "Landlord and Tenant Act (Cap. 301)",
+    shortId: "landlord-and-tenant-act-cap-301",
+    filename: "landlord-and-tenant-act-cap-301.pdf",
+    structure: "act",
+  },
+  {
+    name: "Consumer Protection Act 2012",
+    shortId: "consumer-protection-act-2012",
+    filename: "consumer-protection-act-2012.pdf",
+    structure: "act",
+  },
+  {
+    name: "Sexual Offences Act 2006",
+    shortId: "sexual-offences-act-2006",
+    filename: "sexual-offences-act-2006.pdf",
+    structure: "act",
+  },
 ];
+
+export const LAWS: LawConfig[] = _LAW_IDS_FILTER
+  ? _ALL_LAWS.filter((l) => _LAW_IDS_FILTER!.includes(l.shortId))
+  : _ALL_LAWS;

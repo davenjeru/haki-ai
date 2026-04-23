@@ -10,11 +10,20 @@ export interface Chunk {
   text: string;          // body text for this chunk
   startPage: number;     // PDF page where this section header appears
   pageImageKey?: string; // S3 key for the page PDF, used in the citation carousel
-  // "toc" for table-of-contents / arrangement-of-sections listings, "body"
-  // for substantive legal text. The advanced-RAG retriever filters out
-  // chunks whose chunkType === "toc" because they would otherwise poison
-  // top-k results with indexes that list section titles verbatim.
-  chunkType: "body" | "toc";
+  // Classification used by the advanced-RAG retriever to exclude
+  // low-signal chunks before rerank:
+  //   - "body"        — substantive legal text (retained)
+  //   - "toc"         — table-of-contents / arrangement-of-sections
+  //                     listings (dropped)
+  //   - "preamble"    — cover page / pre-Section 1 OCR noise (dropped)
+  //   - "short-title" — Section 1's "This Act may be cited as …" one-
+  //                     liner. Low signal, high match-rate, so dropped.
+  //   - "definitions" — Section 2's flat Interpretation list. Matches
+  //                     almost any query because it contains every
+  //                     defined term, so dropped for non-definitional
+  //                     retrieval. Re-enable per-query if we add a
+  //                     "what does X mean" intent.
+  chunkType: "body" | "toc" | "preamble" | "short-title" | "definitions";
   // "statute" for chunks derived from Act/Constitution PDFs (default), "faq"
   // for crawled Q&A content (SheriaPlex, KenyaLaw summaries). Bedrock KB uses
   // this to route queries: the FAQAgent filters on corpus="faq" while the

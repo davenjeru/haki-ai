@@ -35,6 +35,34 @@ interface SectionNode {
   isToc: boolean;
 }
 
+// ── Boilerplate classification ───────────────────────────────────────────────
+// Section 1 of an Act is always "Short title" (one-liner citing the Act by
+// name) and Section 2 is always "Interpretation" (flat definitions list).
+// Dense embeddings of these chunks match almost any query because they
+// contain every defined term in the statute, so the retriever treats them
+// as boilerplate. The classifier runs at assemble-time so the chunkType
+// attribute lives in the metadata sidecar and retrieval filters stay
+// cheap (no runtime text inspection).
+
+function classifyChunkType(
+  node: SectionNode
+): "body" | "toc" | "preamble" | "short-title" | "definitions" {
+  if (node.isToc) return "toc";
+  if (node.section === "Preamble") return "preamble";
+  const sectionLower = node.section.toLowerCase();
+  const titleLower = node.title.toLowerCase();
+  if (sectionLower === "section 1" && titleLower.includes("short title")) {
+    return "short-title";
+  }
+  if (
+    sectionLower === "section 2" &&
+    (titleLower.includes("interpretation") || titleLower.includes("definition"))
+  ) {
+    return "definitions";
+  }
+  return "body";
+}
+
 // Matches "Arrangement of Sections" / "Arrangement of Articles" / "Table of
 // Contents" (case-insensitive). Used as a structural fallback when Haiku
 // misses an obvious TOC page (e.g. when the page text contains real section
@@ -112,7 +140,17 @@ export function assembleChunks(
       continue;
     }
 
-    // Page has one or more section headers
+    // Page has one or more section headers.
+    //
+    // Invariant: each newly opened section node starts with an EMPTY lines
+    // array. We only add lines when (a) a later section on the same page
+    // claims the boundary via `linesBeforeHeader`, or (b) the page-end
+    // fallback at the bottom of this branch flushes the tail to the last
+    // open node. This is the fix for the boundary-bleed bug where
+    // `lines: rawLines.slice(hit.bodyStartLine)` eagerly captured the
+    // entire rest of the page — including the next section's header and
+    // body — on the opening iteration. See `swahili_retrieval_ulizallama.plan.md`
+    // §5b (i) for the Land Act failure cases that motivated this change.
     let lastBodyEnd = 0;
 
     for (const hit of sections) {
@@ -133,7 +171,7 @@ export function assembleChunks(
         chapter: currentChapter,
         section: formatSectionLabel(hit.number, law.structure),
         title: hit.title,
-        lines: rawLines.slice(hit.bodyStartLine),
+        lines: [],
         startPage: pageNum,
         isToc: pageIsToc || hasTocHeading(hit.title),
       };
@@ -141,8 +179,13 @@ export function assembleChunks(
       lastBodyEnd = hit.bodyStartLine;
     }
 
-    // Lines after the last section header's body start are already in currentNode.lines
-    // (sliced above). Subsequent pages will continue appending to currentNode.
+    // Page tail: lines after the final section header's body start belong
+    // to the newly opened node. Subsequent pages (handled by the
+    // `sections.length === 0` branch above) will continue appending.
+    if (currentNode !== null && lastBodyEnd < rawLines.length) {
+      currentNode.lines.push(...rawLines.slice(lastBodyEnd));
+      if (pageIsToc) currentNode.isToc = true;
+    }
   }
 
   flush();
@@ -156,6 +199,8 @@ export function assembleChunks(
 
     const segments = splitToSegments(body);
 
+    const chunkType = classifyChunkType(node);
+
     segments.forEach((text, i) => {
       const suffix = segments.length > 1 ? `-${i + 1}` : "";
       const base = slugify(`${law.shortId}-${node.chapter}-${node.section}`);
@@ -168,7 +213,7 @@ export function assembleChunks(
         text,
         startPage: node.startPage,
         pageImageKey: `page-images/${law.shortId}/page-${node.startPage}.pdf`,
-        chunkType: node.isToc ? "toc" : "body",
+        chunkType,
       });
     });
   }
