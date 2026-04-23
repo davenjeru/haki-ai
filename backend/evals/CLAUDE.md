@@ -24,6 +24,19 @@ on the main dashboard.
   table + per-question diffs. Pushes `EvalScore` to CloudWatch.
 - `run.py` — CLI entry: `uv run -m evals.run` (invoked by
   `make eval` locally and `eval-nightly.yml` in CI).
+- `testset_generator.py` — RAGAS synthetic test-set generation.
+  Loads chunks via `rag.catalog.get_catalog`, stratified-subsamples
+  by statute, wires budget-tracked `ChatBedrock` + `BedrockEmbeddings`,
+  runs two personas (English legal practitioner + Swahili
+  pro-se litigant) at a 70/30 single-hop/multi-hop split, and maps
+  rows back onto the `GoldenCase` schema.
+- `generate.py` — CLI for the above: `make gen-testset SIZE=50
+  MAX_COST=5`. Runs a pre-flight estimate, refuses to start if it
+  exceeds `--max-cost`, writes `generated_set.jsonl` plus a sibling
+  `generated_set.cost.md` report.
+- `generation_cost.py` — `BudgetTracker` + `PRICE_TABLE` for mid-run
+  hard-cap aborts, plus a post-run `aggregate_from_langsmith()` that
+  walks the trace tree to produce the authoritative cost breakdown.
 
 ## Internal data flow
 
@@ -44,3 +57,9 @@ flowchart LR
   compiled LangGraph so evals reflect the agent, not the HTTP shim.
 - Report paths include a timestamp so nightly runs don't clobber
   each other.
+- The generated test-set is kept **separate** from `golden_set.jsonl`.
+  Treat `generated_set.jsonl` as an exploration set — hand-pick rows
+  worth promoting into the curated golden set; never auto-merge.
+- All Bedrock-spending paths (the generator, RAGAS scoring) must run
+  under a LangSmith `@traceable` scope so `generation_cost.py` /
+  the nightly job can attribute spend back to a single trace.

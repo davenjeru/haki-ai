@@ -16,7 +16,7 @@ SHELL := /usr/bin/env bash
 REPO_ROOT := $(shell pwd)
 
 .PHONY: help setup deps env bootstrap local-apply dev backend-dev frontend-dev \
-        pipeline-dev ingest-local test eval audit clean check-tools
+        pipeline-dev ingest-local test eval gen-testset audit clean check-tools
 
 help:
 	@echo "Haki AI — common targets:"
@@ -24,6 +24,7 @@ help:
 	@echo "  make dev            Run the full local stack (LocalStack + backend + frontend)."
 	@echo "  make test           Run backend + frontend + pipeline tests."
 	@echo "  make eval           Run the RAG evaluation harness against the golden set."
+	@echo "  make gen-testset    Synthesise a bilingual eval set via RAGAS (Bedrock \$$)."
 	@echo "  make audit CATEGORY=land   Per-case retrieval triage (hit / noise / rerank-loss)."
 	@echo "  make ingest-local   Ingest statute chunks (processed-chunks/) into local ChromaDB."
 	@echo ""
@@ -115,6 +116,22 @@ test:
 
 eval:
 	cd backend && uv run python -m evals.run
+
+# RAGAS synthetic test-set generator — produces a bilingual
+# generated_set.jsonl + generated_set.cost.md by sampling the corpus and
+# asking Claude (on Bedrock) to synthesise questions. LLM-heavy, so every
+# run is gated by a hard --max-cost budget.
+#
+#   make gen-testset                        # size=50, subsample=200, max-cost=10
+#   make gen-testset SIZE=20 MAX_COST=2     # cheap smoke run
+#   make gen-testset DRY_RUN=1              # print pre-flight estimate only
+gen-testset:
+	cd backend && uv run python -m evals.generate \
+	  --size $(if $(SIZE),$(SIZE),50) \
+	  --subsample $(if $(SUBSAMPLE),$(SUBSAMPLE),200) \
+	  --max-cost $(if $(MAX_COST),$(MAX_COST),10) \
+	  $(if $(DRY_RUN),--dry-run) \
+	  $(if $(OUTPUT),--output $(OUTPUT))
 
 # Per-case retrieval audit — re-runs the pipeline for one category and
 # classifies each top-5 as hit / noise-pollution / rerank-loss. Used to

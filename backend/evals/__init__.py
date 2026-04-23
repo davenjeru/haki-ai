@@ -28,6 +28,18 @@ ragas_run
     dependency group isn't installed, the RAGAS step is skipped with a
     clear warning and only the LLM-judge score is computed.
 
+testset_generator / generate
+    Synthetic test-set generation using RAGAS. ``testset_generator``
+    loads the chunk catalog, builds budget-tracked Bedrock wrappers, and
+    drives ``ragas.testset.TestsetGenerator`` with bilingual personas.
+    ``generate`` is the CLI: ``uv run -m evals.generate --size 50``.
+
+generation_cost
+    ``BudgetTracker`` for mid-run cost accounting (hard caps on
+    ``--max-cost``) plus a post-run aggregator that walks the LangSmith
+    trace tree and produces an authoritative cost report, falling back
+    to a local ``PRICE_TABLE`` when LangSmith prices aren't configured.
+
 report
     Writes ``evals/reports/{timestamp}.md`` with per-question diffs and a
     summary table, then emits a single ``eval_score`` CloudWatch metric

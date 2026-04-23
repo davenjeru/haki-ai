@@ -2181,6 +2181,222 @@ class TestSpecialistMarksRefusalBlocked(unittest.TestCase):
         self.assertFalse(out["specialist_outputs"][0]["blocked"])
 
 
+# ── Generation cost ───────────────────────────────────────────────────────────
+
+
+class TestResolvePrice(unittest.TestCase):
+    """Bedrock model-id matching is fiddly across regional prefixes and
+    model-version suffixes. These tests pin the behaviour so a rename
+    in PRICE_TABLE is caught before it silently zeroes out a cost column."""
+
+    def test_bare_bedrock_id_matches(self):
+        from evals.generation_cost import _resolve_price
+        price = _resolve_price("anthropic.claude-3-5-sonnet-20241022-v2:0")
+        self.assertIsNotNone(price)
+        self.assertEqual(price["input"], 0.003)
+
+    def test_regional_prefix_is_stripped(self):
+        from evals.generation_cost import _resolve_price
+        price = _resolve_price("us.anthropic.claude-3-5-sonnet-20241022-v2:0")
+        self.assertIsNotNone(price)
+        self.assertEqual(price["output"], 0.015)
+
+    def test_titan_embeddings_priced(self):
+        from evals.generation_cost import _resolve_price
+        price = _resolve_price("amazon.titan-embed-text-v2:0")
+        self.assertIsNotNone(price)
+        self.assertEqual(price["output"], 0.0)
+
+    def test_unknown_model_returns_none(self):
+        from evals.generation_cost import _resolve_price
+        self.assertIsNone(_resolve_price("mistral.nonexistent-v99"))
+        self.assertIsNone(_resolve_price(""))
+
+
+class TestBudgetTracker(unittest.TestCase):
+    def test_record_accumulates_cost(self):
+        from evals.generation_cost import BudgetTracker
+        t = BudgetTracker()
+        t.record("anthropic.claude-3-5-sonnet-20241022-v2:0", 1000, 500)
+        # 1000 * 0.003/1000 + 500 * 0.015/1000 = 0.003 + 0.0075 = 0.0105
+        self.assertAlmostEqual(t.total_cost, 0.0105, places=6)
+        self.assertEqual(t.total_tokens, 1500)
+
+    def test_hard_cap_raises(self):
+        from evals.generation_cost import BudgetTracker, BudgetExceededError
+        t = BudgetTracker(max_cost=0.01)
+        # Under cap — no raise.
+        t.record("anthropic.claude-3-5-sonnet-20241022-v2:0", 100, 100)
+        # Over cap.
+        with self.assertRaises(BudgetExceededError):
+            t.record("anthropic.claude-3-5-sonnet-20241022-v2:0", 10000, 10000)
+
+    def test_unknown_model_still_tracked(self):
+        """Unknown models count toward call/token totals but contribute
+        $0 to cost — so a silent pricing gap can't hide the spend."""
+        from evals.generation_cost import BudgetTracker
+        t = BudgetTracker()
+        t.record("mistral.unpriced-v1", 1000, 1000)
+        self.assertEqual(t.total_tokens, 2000)
+        self.assertEqual(t.total_cost, 0.0)
+
+
+class TestEstimateGenerationCost(unittest.TestCase):
+    def test_estimate_scales_with_subsample(self):
+        from evals.generation_cost import estimate_generation_cost
+        small = estimate_generation_cost(
+            num_chunks=50, testset_size=10,
+            llm_model_id="anthropic.claude-3-5-sonnet-20241022-v2:0",
+            embed_model_id="amazon.titan-embed-text-v2:0",
+        )
+        large = estimate_generation_cost(
+            num_chunks=500, testset_size=10,
+            llm_model_id="anthropic.claude-3-5-sonnet-20241022-v2:0",
+            embed_model_id="amazon.titan-embed-text-v2:0",
+        )
+        # 10x more chunks → KG extraction dominates → at least 5x more
+        # total. Not 10x because synthesis cost is fixed on testset_size.
+        self.assertGreater(large, small * 5)
+
+    def test_estimate_positive_for_known_models(self):
+        from evals.generation_cost import estimate_generation_cost
+        est = estimate_generation_cost(
+            num_chunks=200, testset_size=50,
+            llm_model_id="anthropic.claude-3-5-sonnet-20241022-v2:0",
+            embed_model_id="amazon.titan-embed-text-v2:0",
+        )
+        self.assertGreater(est, 0)
+
+
+class TestCostReportMarkdown(unittest.TestCase):
+    def test_markdown_has_total_row(self):
+        from evals.generation_cost import CostReport, _ModelUsage
+        report = CostReport(
+            by_model={
+                "claude": _ModelUsage(calls=5, input_tokens=1000, output_tokens=500, cost_usd=0.02),
+                "titan": _ModelUsage(calls=20, input_tokens=5000, output_tokens=0, cost_usd=0.0001),
+            },
+            total_cost=0.0201,
+            total_tokens=6500,
+            source="local_tracker",
+        )
+        md = report.to_markdown()
+        self.assertIn("**Total**", md)
+        self.assertIn("$0.0201", md)
+        self.assertIn("claude", md)
+        self.assertIn("titan", md)
+
+
+# ── Testset generator helpers ────────────────────────────────────────────────
+
+
+class TestInferCategory(unittest.TestCase):
+    def test_known_source_maps_to_category(self):
+        from evals.testset_generator import _infer_category
+        self.assertEqual(_infer_category(["Employment Act 2007"]), "employment")
+        self.assertEqual(_infer_category(["Constitution of Kenya 2010"]), "constitution")
+        self.assertEqual(_infer_category(["Land Act 2012"]), "land")
+
+    def test_first_known_wins(self):
+        """When a question spans multiple statutes, category is pinned
+        to the first recognised one so retrieval filters in the eval
+        runner still get a sensible source filter."""
+        from evals.testset_generator import _infer_category
+        self.assertEqual(
+            _infer_category(["Employment Act 2007", "Constitution of Kenya 2010"]),
+            "employment",
+        )
+
+    def test_unknown_source_falls_back(self):
+        from evals.testset_generator import _infer_category
+        self.assertEqual(_infer_category([]), "uncategorised")
+        self.assertEqual(_infer_category(["Imaginary Act 9999"]), "uncategorised")
+
+
+class TestDetectLanguageGenerator(unittest.TestCase):
+    """Generator-local language heuristic. Independent of the
+    Comprehend-based detector in app.graph — we can't call AWS from
+    inside a generation loop."""
+
+    def test_pure_english(self):
+        from evals.testset_generator import _detect_language
+        self.assertEqual(
+            _detect_language("What does Article 28 of the Constitution protect?"),
+            "english",
+        )
+
+    def test_pure_swahili(self):
+        from evals.testset_generator import _detect_language
+        self.assertEqual(
+            _detect_language("Je, sheria inasema nini kuhusu haki yangu ya kupiga kura?"),
+            "swahili",
+        )
+
+    def test_mixed_code_switch(self):
+        from evals.testset_generator import _detect_language
+        self.assertEqual(
+            _detect_language("Nina haki gani under Article 49 of the Constitution?"),
+            "mixed",
+        )
+
+    def test_empty_falls_back_to_english(self):
+        from evals.testset_generator import _detect_language
+        self.assertEqual(_detect_language(""), "english")
+
+
+class TestSubsampleStratified(unittest.TestCase):
+    def test_every_source_represented(self):
+        """No statute should silently drop out of the subsample — the
+        floor-of-1-per-source rule guarantees the Constitution shows up
+        even when it's dwarfed by Employment Act chunk counts."""
+        from evals.testset_generator import _Chunk, subsample
+        chunks = (
+            [_Chunk(f"c{i}", "body text " * 5, {"source": "Employment Act 2007"}) for i in range(900)]
+            + [_Chunk(f"k{i}", "katiba text " * 5, {"source": "Constitution of Kenya 2010"}) for i in range(100)]
+            + [_Chunk(f"l{i}", "land text " * 5, {"source": "Land Act 2012"}) for i in range(50)]
+        )
+        picked = subsample(chunks, size=50, seed=0)
+        sources = {c.metadata["source"] for c in picked}
+        self.assertEqual(sources, {"Employment Act 2007", "Constitution of Kenya 2010", "Land Act 2012"})
+        self.assertLessEqual(len(picked), 50)
+
+    def test_returns_all_when_size_ge_corpus(self):
+        from evals.testset_generator import _Chunk, subsample
+        chunks = [_Chunk(f"c{i}", "t", {"source": "X"}) for i in range(10)]
+        self.assertEqual(len(subsample(chunks, size=999)), 10)
+
+    def test_deterministic_with_seed(self):
+        from evals.testset_generator import _Chunk, subsample
+        chunks = [_Chunk(f"c{i}", "t", {"source": "X"}) for i in range(100)]
+        a = [c.chunk_id for c in subsample(chunks, size=20, seed=42)]
+        b = [c.chunk_id for c in subsample(chunks, size=20, seed=42)]
+        self.assertEqual(a, b)
+
+
+class TestGeneratedCaseJsonl(unittest.TestCase):
+    def test_roundtrip_matches_golden_schema(self):
+        """GeneratedCase.to_jsonl must produce a record that
+        GoldenCase.from_dict accepts without modification, so a hand-
+        picked row from generated_set.jsonl can be copy-pasted into
+        golden_set.jsonl."""
+        from evals.testset_generator import GeneratedCase
+        from evals.loader import GoldenCase
+        case = GeneratedCase(
+            id="gen-001",
+            category="employment",
+            question="What notice period applies to termination?",
+            reference_answer="Section 35 sets the statutory notice period.",
+            expected_sources=["Employment Act 2007"],
+            expected_sections=["Section 35"],
+            language="english",
+        )
+        line = case.to_jsonl()
+        parsed = GoldenCase.from_dict(json.loads(line))
+        self.assertEqual(parsed.id, "gen-001")
+        self.assertEqual(parsed.expected_sources, ["Employment Act 2007"])
+        self.assertEqual(parsed.language, "english")
+
+
 # ── Runner ────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -2209,6 +2425,14 @@ if __name__ == "__main__":
         TestAuditClassify,
         TestSpecialistOutputsReducer,
         TestSpecialistMarksRefusalBlocked,
+        TestResolvePrice,
+        TestBudgetTracker,
+        TestEstimateGenerationCost,
+        TestCostReportMarkdown,
+        TestInferCategory,
+        TestDetectLanguageGenerator,
+        TestSubsampleStratified,
+        TestGeneratedCaseJsonl,
     ]:
         suite.addTests(loader.loadTestsFromTestCase(cls))
 

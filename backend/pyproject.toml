@@ -24,7 +24,14 @@ local = [
 # RAGAS pulls ~200MB of langchain + datasets + pyarrow that we never want
 # in the Lambda zip. Kept behind an opt-in group so CI can run a full
 # RAGAS sweep while dev-loop runs of `uv run -m evals.run` stay fast.
+#
+# langchain-aws is the canonical wrapper for ChatBedrock + BedrockEmbeddings;
+# RAGAS uses these via LangchainLLMWrapper / LangchainEmbeddingsWrapper for
+# both the metric scorer (`ragas_run.py`) and the test-set generator
+# (`testset_generator.py`).
 evals = [
     "ragas>=0.2.0",
     "datasets>=2.19.0",
+    "langchain-aws>=0.2.0",
+    "langchain-core>=0.3.0",
 ]
