@@ -11,9 +11,15 @@ constrains the output to a fixed set of agent names so the caller can rely
 on a canonical routing list.
 
 Failure modes:
-  - Malformed JSON           \u2192 default to ["employment"] (most common intent
-                                in a legal aid chatbot, so the worst-case
-                                fallback still produces a relevant answer).
+  - Malformed JSON           \u2192 default to ["chat"]. ``chat`` replies
+                                conversationally and bilingually-refuses
+                                off-topic turns, so it is the safest
+                                no-op route when we can't trust the model's
+                                output. Previously this fell back to
+                                ``["employment"]`` which produced
+                                hallucinated statute answers for
+                                conversational turns (see "Naitwa nani?"
+                                regression in backend/tests/test_unit.py).
   - Empty agents array       \u2192 same fallback.
   - Unknown agent name       \u2192 dropped from the routing list.
 
@@ -26,7 +32,9 @@ context in both codepaths.
 from __future__ import annotations
 
 import json
+import random
 import re
+import time
 from typing import Any
 
 from prompts import SUPERVISOR_PROMPT
@@ -35,12 +43,26 @@ from prompts import SUPERVISOR_PROMPT
 # Canonical agent names the supervisor may select. Anything else is dropped.
 KNOWN_AGENTS = frozenset({"constitution", "employment", "land", "faq", "chat"})
 
-# Fallback when the model returns nothing we can use.
-_FALLBACK = ["employment"]
+# Fallback when the model returns nothing we can use. ``chat`` is the only
+# safe default: it replies conversationally / bilingually-refuses for
+# off-topic questions without pulling statute citations that may be
+# irrelevant to the user's actual intent. Defaulting to a statute specialist
+# here used to cause hallucinated "employment" answers for conversational
+# Swahili turns like ``Naitwa nani?`` whenever the Bedrock routing call
+# flaked. See backend/tests/test_unit.py::TestSupervisorFallback.
+_FALLBACK = ["chat"]
 
 _MAX_CONTEXT_CHARS = 4000
 _RECENT_TURN_LIMIT = 6
 _MAX_AGENTS = 3
+
+# One retry before falling back. Haiku 4.5 has a 10 RPM account quota and
+# transient ``ThrottlingException``s were showing up in the "Naitwa nani?"
+# trace, so a cheap retry meaningfully reduces the fallback rate without
+# materially increasing p95 latency on the happy path.
+_BEDROCK_RETRY_ATTEMPTS = 2
+_BEDROCK_RETRY_BASE_DELAY_S = 0.3
+_BEDROCK_RETRY_MAX_DELAY_S = 1.5
 
 
 def _format_transcript(messages: list[dict]) -> str:
@@ -107,15 +129,35 @@ def route_supervisor(
         "system": SUPERVISOR_PROMPT,
         "messages": [{"role": "user", "content": transcript or "(empty)"}],
     }
-    try:
-        response = bedrock_runtime.invoke_model(
-            modelId=model_id,
-            body=json.dumps(body),
-            contentType="application/json",
-            accept="application/json",
-        )
-    except Exception as err:
-        print(f"[supervisor] Bedrock call failed, using fallback route: {err}")
+
+    last_err: Exception | None = None
+    for attempt in range(_BEDROCK_RETRY_ATTEMPTS):
+        try:
+            response = bedrock_runtime.invoke_model(
+                modelId=model_id,
+                body=json.dumps(body),
+                contentType="application/json",
+                accept="application/json",
+            )
+            break
+        except Exception as err:  # noqa: BLE001 - we log and degrade gracefully
+            last_err = err
+            if attempt + 1 < _BEDROCK_RETRY_ATTEMPTS:
+                # Exponential backoff with a small amount of jitter so
+                # simultaneous retries across concurrent Lambda invocations
+                # don't stampede the 10 RPM Haiku quota in lockstep.
+                delay = min(
+                    _BEDROCK_RETRY_BASE_DELAY_S * (2 ** attempt),
+                    _BEDROCK_RETRY_MAX_DELAY_S,
+                )
+                time.sleep(delay + random.uniform(0, delay / 2))
+                continue
+            print(
+                f"[supervisor] Bedrock call failed after {attempt + 1} "
+                f"attempt(s), using fallback route {_FALLBACK}: {err}"
+            )
+            return list(_FALLBACK), "bedrock_error"
+    else:  # pragma: no cover - loop always breaks or returns above
         return list(_FALLBACK), "bedrock_error"
 
     result = json.loads(response["body"].read())
