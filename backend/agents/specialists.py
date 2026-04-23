@@ -25,20 +25,48 @@ A specialist call returns:
     }
 
 The pipeline orchestrator in `graph.py` appends specialist outputs to
-state via an `operator.add` reducer so LangGraph merges parallel branches
-without a custom reducer.
+state via a custom reducer (`_specialist_outputs_reducer`). The reducer
+concatenates within a turn but treats ``None`` as a reset sentinel that
+the supervisor emits each turn \u2014 this prevents the checkpointer from
+carrying stale outputs from prior turns into the current synthesis.
 """
 
 from __future__ import annotations
 
 from agents.chat import invoke_chat
-from prompts import build_system_prompt
+from prompts import BILINGUAL_REFUSAL, build_system_prompt
 from rag import (
     blocked_response,
     check_guardrail_block,
     extract_citations,
     run_rag,
 )
+
+
+# Substrings of BILINGUAL_REFUSAL that uniquely identify a model-emitted
+# out-of-scope refusal. We can't do an exact-equality check because the
+# model occasionally appends trailing whitespace / punctuation, and chat
+# agent output is composed from tokens streamed by Bedrock.
+_REFUSAL_MARKERS = (
+    "Mimi ni msaidizi wa kisheria wa Kenya tu",
+    "I can only help with Kenyan legal matters",
+)
+
+
+def _is_model_emitted_refusal(text: str) -> bool:
+    """
+    Returns True iff ``text`` contains the canonical bilingual refusal.
+
+    The synthesizer treats ``blocked=True`` specialists as a hard-stop
+    fast-path (no merging with other specialists, no citations). Without
+    this detection, a chat agent that correctly refused an off-topic turn
+    would still be merged with e.g. the previous turn's employment answer,
+    surfacing confusing mixed output. See the "Naitwa nani?" trace for the
+    exact failure mode this guards against.
+    """
+    if not text:
+        return False
+    return all(marker in text for marker in _REFUSAL_MARKERS)
 
 
 # Registry mapping agent name \u2192 (display_name, retrieval_filter).
@@ -140,7 +168,12 @@ def build_specialist(
                 bedrock_runtime,
                 model_id,
             )
-            return {"specialist_outputs": [_specialist_output(agent, text=text, citations=[])]}
+            return {"specialist_outputs": [_specialist_output(
+                agent,
+                text=text,
+                citations=[],
+                blocked=_is_model_emitted_refusal(text),
+            )]}
 
         system_prompt = build_system_prompt(language)
         result = run_rag(
@@ -162,8 +195,20 @@ def build_specialist(
 
         citations = extract_citations(result, s3_client=s3_client, bucket=s3_bucket)
         text = result.get("output", {}).get("text", "")
+        # A statute specialist that declines the turn (e.g. the user's
+        # question is genuinely off-topic for this statute) emits the
+        # bilingual refusal verbatim per the prompt. Flag it so the
+        # synthesizer's blocked fast-path handles it, drops citations,
+        # and doesn't interleave this specialist with a peer that happens
+        # to have an answer.
+        refusal = _is_model_emitted_refusal(text)
         return {
-            "specialist_outputs": [_specialist_output(agent, text=text, citations=citations)]
+            "specialist_outputs": [_specialist_output(
+                agent,
+                text=text,
+                citations=[] if refusal else citations,
+                blocked=refusal,
+            )]
         }
 
     _run.__name__ = f"{agent}_agent"
