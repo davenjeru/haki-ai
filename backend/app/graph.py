@@ -44,7 +44,6 @@ from __future__ import annotations
 
 import os
 import uuid
-from operator import add
 from typing import Annotated, TypedDict
 
 from langchain_core.messages import AIMessage
@@ -75,15 +74,45 @@ _DOMINANCE_THRESHOLD = 0.85
 
 # ── State ─────────────────────────────────────────────────────────────────────
 
+def _specialist_outputs_reducer(
+    existing: list[dict] | None,
+    incoming: list[dict] | None,
+) -> list[dict]:
+    """
+    Reducer for ``specialist_outputs``.
+
+    Within a turn we fan out to multiple specialists in parallel and each
+    branch returns a one-item list. The natural reducer for that is list
+    concatenation (``operator.add``) \u2014 which is what we used to have.
+
+    But the LangGraph checkpointer persists ``AgentState`` across turns
+    within a thread, so a plain-concat reducer silently accumulates every
+    specialist output from every prior turn. By turn N the synthesizer saw
+    N-1 stale outputs plus the current turn's and merged them into nonsense
+    (see the ``Naitwa nani?`` regression: ``specialist_outputs`` contained
+    both the previous COVID-termination answer *and* the current turn's
+    bilingual refusal, and the synthesizer happily blended them).
+
+    This reducer fixes that by treating ``None`` as a per-turn reset
+    sentinel. The supervisor node emits ``None`` at the start of each turn;
+    specialist branches still return one-item lists that get appended as
+    before.
+    """
+    if incoming is None:
+        return []
+    return (existing or []) + incoming
+
+
 class AgentState(TypedDict, total=False):
     messages: Annotated[list[dict], add_messages]
     language: str
     # Phase 2 \u2014 supervisor output
     selected_agents: list[str]
     routing_reason: str
-    # Parallel fan-out accumulates specialist outputs here; `operator.add`
-    # concatenates lists returned by different branches.
-    specialist_outputs: Annotated[list[dict], add]
+    # See ``_specialist_outputs_reducer`` above for why this is not a plain
+    # ``operator.add`` reducer. The supervisor emits ``None`` each turn to
+    # reset the list before fan-out begins.
+    specialist_outputs: Annotated[list[dict], _specialist_outputs_reducer]
     # Phase 2 \u2014 final merged output (written by synthesizer)
     citations: list[dict]
     blocked: bool
@@ -241,6 +270,11 @@ def _build_nodes(config):
             "routing_reason": reason,
             # Also set needs_rag for back-compat metadata + handler paths.
             "needs_rag": selected != ["chat"],
+            # Per-turn reset sentinel. Consumed by
+            # ``_specialist_outputs_reducer`` to clear stale outputs from
+            # the previous turn that the checkpointer would otherwise
+            # carry forward into this turn's synthesis.
+            "specialist_outputs": None,
         }
 
     specialist_nodes = {
