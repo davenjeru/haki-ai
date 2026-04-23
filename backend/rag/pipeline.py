@@ -140,8 +140,13 @@ def run_rag(
     # 3. RRF fusion across all 2\u00d7len(variants) result lists.
     fused = rrf.fuse(dense_lists + sparse_lists)[:fuse_top_n]
 
-    # 4. Filter: drop TOC chunks, then dedup by (source, section).
+    # 4. Filter: drop TOC + boilerplate (preamble, short-title,
+    # definitions), then dedup by (source, section). Boilerplate is
+    # dropped unconditionally for v1 because none of the current golden
+    # questions are definitional; if we later add a "/define X" flow the
+    # filter should be gated by a query-intent classifier.
     filtered = filter_module.drop_toc(fused)
+    filtered = filter_module.drop_boilerplate(filtered)
     deduped = filter_module.dedup_by_section(filtered)
 
     # 5. Rerank with Cohere Rerank v3.5 (returns top_n).
