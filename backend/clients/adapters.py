@@ -157,9 +157,6 @@ class LocalRAGAdapter:
         chroma_port: int = 8000,
         guardrail_id: str = "",
         guardrail_version: str = "",
-        sagemaker_runtime=None,
-        sagemaker_endpoint_name: str = "",
-        use_finetuned_model: bool = False,
     ):
         self._bedrock_runtime = bedrock_runtime
         self._bedrock_agent_runtime = bedrock_agent_runtime
@@ -169,9 +166,6 @@ class LocalRAGAdapter:
         self._aws_region = aws_region
         self._guardrail_id = guardrail_id
         self._guardrail_version = guardrail_version
-        self._sagemaker_runtime = sagemaker_runtime
-        self._sagemaker_endpoint_name = sagemaker_endpoint_name
-        self._use_finetuned_model = use_finetuned_model
 
         if chroma_host:
             self._collection = _ChromaHttpClient(chroma_host, chroma_port)
@@ -266,20 +260,7 @@ class LocalRAGAdapter:
         context: str,
         model_id: str,
     ) -> tuple[str, str]:
-        """Calls Claude InvokeModel (or the fine-tuned SageMaker endpoint)."""
-        if self._use_finetuned_model and self._sagemaker_endpoint_name and self._sagemaker_runtime is not None:
-            try:
-                from rag.sagemaker_generator import generate as _sm_generate
-                return _sm_generate(
-                    query=query,
-                    system_prompt=system_prompt,
-                    context=context,
-                    endpoint_name=self._sagemaker_endpoint_name,
-                    sagemaker_runtime=self._sagemaker_runtime,
-                )
-            except Exception as err:
-                print(f"[rag.generate] SageMaker endpoint failed, falling back to Bedrock: {err}")
-
+        """Calls Claude InvokeModel."""
         from rag.generator import generate as _generate
         return _generate(
             query=query,
@@ -343,13 +324,11 @@ class BedrockRAGAdapter:
         config,
         *,
         s3_client,
-        sagemaker_runtime=None,
     ):
         self._bedrock_agent_runtime = bedrock_agent_runtime
         self._bedrock_runtime = bedrock_runtime
         self._config = config
         self._s3_client = s3_client
-        self._sagemaker_runtime = sagemaker_runtime
 
     @property
     def catalog_s3_client(self):
@@ -421,30 +400,7 @@ class BedrockRAGAdapter:
         context: str,
         model_id: str,
     ) -> tuple[str, str]:
-        """Claude InvokeModel call with guardrail attached.
-
-        When the ``USE_FINETUNED_MODEL`` flag is set and a SageMaker
-        endpoint is configured, we call the fine-tuned Llama-3.1-8B
-        adapter instead. Any error falls back to Bedrock Claude so a
-        cold-start or endpoint blip never breaks the user request.
-        """
-        if (
-            self._config.use_finetuned_model
-            and self._config.sagemaker_endpoint_name
-            and self._sagemaker_runtime is not None
-        ):
-            try:
-                from rag.sagemaker_generator import generate as _sm_generate
-                return _sm_generate(
-                    query=query,
-                    system_prompt=system_prompt,
-                    context=context,
-                    endpoint_name=self._config.sagemaker_endpoint_name,
-                    sagemaker_runtime=self._sagemaker_runtime,
-                )
-            except Exception as err:
-                print(f"[rag.generate] SageMaker endpoint failed, falling back to Bedrock: {err}")
-
+        """Claude InvokeModel call with guardrail attached."""
         from rag.generator import generate as _generate
         return _generate(
             query=query,

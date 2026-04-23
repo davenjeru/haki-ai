@@ -26,9 +26,6 @@ this pipeline so dev/prod retrieval behaviour stays identical.
   so segmented chunks don't produce duplicate references.
 - `generator.py` — Claude `invoke_model` with assembled context
   window; enforces bilingual refusal on out-of-scope answers.
-- `sagemaker_generator.py` — optional fine-tuned Llama-3.1-8B endpoint
-  (Phase 4b). Called when `USE_FINETUNED_MODEL=true`; on any error the
-  adapter falls back to `generator.py` (Claude) transparently.
 - `catalog.py` — cached list of all chunk IDs + metadata used to warm
   the BM25 index.
 
@@ -44,7 +41,7 @@ flowchart LR
   rrf --> flt[filters.drop_toc + source]
   flt --> rr[reranker.rerank]
   rr --> dd[citations.dedup]
-  dd --> gen[generator or sagemaker_generator]
+  dd --> gen[generator]
   gen --> out[response + citations]
 ```
 

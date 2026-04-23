@@ -60,7 +60,7 @@ resource "aws_iam_role" "github_actions" {
 }
 
 # Deploy needs to touch ~every service in the stack (Lambda,
-# API Gateway, Bedrock, SageMaker, S3, CloudFront, DynamoDB,
+# API Gateway, Bedrock, S3, CloudFront, DynamoDB,
 # CloudWatch, EventBridge, SNS, SSM, IAM, Comprehend). For a
 # demo project we attach AdministratorAccess; a production
 # setup would replace this with a service-scoped policy

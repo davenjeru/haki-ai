@@ -83,9 +83,9 @@ resource "aws_iam_role_policy" "lambda_policy" {
           Action   = ["s3:GetObject"]
           Resource = "${var.data_bucket_arn}/page-images/*"
         },
-        # S3 — list + read access on processed-chunks/ + faq-chunks/ for the
-        # BM25 sparse index. `rag.bm25` loads every chunk JSON at cold start
-        # to tokenise it; without `ListBucket` the cold-start list fails and
+        # S3 — list + read access on processed-chunks/ for the BM25 sparse
+        # index. `rag.bm25` loads every chunk JSON at cold start to
+        # tokenise it; without `ListBucket` the cold-start list fails and
         # the whole hybrid retriever throws AccessDenied.
         {
           Effect = "Allow"
@@ -97,7 +97,6 @@ resource "aws_iam_role_policy" "lambda_policy" {
             StringLike = {
               "s3:prefix" = [
                 "processed-chunks/*",
-                "faq-chunks/*",
               ]
             }
           }
@@ -107,7 +106,6 @@ resource "aws_iam_role_policy" "lambda_policy" {
           Action = ["s3:GetObject"]
           Resource = [
             "${var.data_bucket_arn}/processed-chunks/*",
-            "${var.data_bucket_arn}/faq-chunks/*",
           ]
         },
       ],
@@ -235,7 +233,7 @@ data "archive_file" "lambda_zip" {
     "tests/**",
     "evals", # eval harness is dev-only; shipped via CI not Lambda
     "evals/**",
-    "scripts", # prepare_finetune_data etc. — offline helpers only
+    "scripts", # offline helpers only — not needed in the Lambda runtime
     "scripts/**",
     "*_local.py", # legacy local-only scripts (pre-refactor, if any stragglers)
     "app/server_local.py",

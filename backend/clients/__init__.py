@@ -92,16 +92,6 @@ def make_dynamodb_table(config: Config, table_name: str):
     return boto3.resource("dynamodb", region_name=config.aws_region).Table(table_name)
 
 
-def make_sagemaker_runtime(config: Config):
-    """
-    SageMaker Runtime client used to call the fine-tuned Llama-3.1-8B
-    endpoint when USE_FINETUNED_MODEL=true. LocalStack does not support
-    SageMaker inference, so this always targets real AWS — the backend
-    falls back to Bedrock automatically on any error.
-    """
-    return boto3.client("sagemaker-runtime", region_name=config.aws_region)
-
-
 def make_s3(config: Config):
     """
     S3 client used for generating presigned GET URLs for per-page PDFs

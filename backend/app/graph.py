@@ -10,14 +10,14 @@ LangGraph orchestration for Haki AI (Phase 2 two-tier multi-agent).
                          |    supervisor    |  Haiku routing \u2192 selected_agents
                          +--------+---------+
                                   |
-           +----------+-----------+------+--------+
-           |          |           |              |
-           v          v           v              v
-      constitution  employment   land           faq       chat
-      specialist    specialist   specialist     specialist agent
-           \\         |           |              /          |
-            \\________+___________+_____________/           |
-                            |                              |
+           +----------+-----------+------+
+           |          |           |     |
+           v          v           v     v
+      constitution  employment   land   chat
+      specialist    specialist   specialist  agent
+           \\         |           /          |
+            \\________+__________/           |
+                            |                |
                             v                              v
                      +-------------+               +--------------+
                      | synthesizer |               | synthesizer  |
@@ -61,7 +61,6 @@ from clients import (
     make_comprehend,
     make_dynamodb_table,
     make_s3,
-    make_sagemaker_runtime,
 )
 from rag import refresh_presigned_urls
 
@@ -179,7 +178,6 @@ def _make_rag_adapter(
     s3_client,
     bedrock_runtime,
     bedrock_agent_runtime,
-    sagemaker_runtime=None,
 ):
     if config.is_local:
         return LocalRAGAdapter(
@@ -194,16 +192,12 @@ def _make_rag_adapter(
             chroma_port=config.chroma_port,
             guardrail_id=config.guardrail_id,
             guardrail_version=config.guardrail_version,
-            sagemaker_runtime=sagemaker_runtime,
-            sagemaker_endpoint_name=config.sagemaker_endpoint_name,
-            use_finetuned_model=config.use_finetuned_model,
         )
     return BedrockRAGAdapter(
         bedrock_agent_runtime=bedrock_agent_runtime,
         bedrock_runtime=bedrock_runtime,
         config=config,
         s3_client=s3_client,
-        sagemaker_runtime=sagemaker_runtime,
     )
 
 
@@ -242,17 +236,11 @@ def _build_nodes(config):
     bedrock_runtime = make_bedrock_runtime(config)
     bedrock_agent_runtime = make_bedrock_agent_runtime(config)
     s3 = make_s3(config)
-    sagemaker_runtime = (
-        make_sagemaker_runtime(config)
-        if config.use_finetuned_model and config.sagemaker_endpoint_name
-        else None
-    )
     rag_adapter = _make_rag_adapter(
         config,
         s3_client=s3,
         bedrock_runtime=bedrock_runtime,
         bedrock_agent_runtime=bedrock_agent_runtime,
-        sagemaker_runtime=sagemaker_runtime,
     )
 
     def detect_language_node(state: AgentState) -> dict:

@@ -3,7 +3,7 @@ name: CI
 # Runs on every PR. Keeps Haki AI demoable:
 #   - backend unit tests (fast, no AWS)
 #   - frontend typecheck + build
-#   - pipeline typecheck + crawler extraction test
+#   - pipeline typecheck + unit tests
 #   - terraform validate for infra
 #
 # The full evaluation harness (RAGAS + LLM-judge) runs on the nightly
@@ -84,7 +84,7 @@ jobs:
         working-directory: pipeline
         run: npm run typecheck
 
-      - name: Test (crawler snapshots)
+      - name: Test
         working-directory: pipeline
         run: npm test
 

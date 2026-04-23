@@ -51,9 +51,8 @@ resource "aws_s3_bucket_cors_configuration" "data" {
 # ── EventBridge notifications ────────────────────────────────────────────────
 # Phase 5b: enabling EventBridge on the data bucket lets the ingestion-trigger
 # Lambda in modules/compute listen for Object Created events under
-# processed-chunks/* and faq-chunks/*. When a pipeline run drops new chunks,
-# the rule fires and starts a Bedrock KB ingestion job — no operator click
-# required.
+# processed-chunks/*. When a pipeline run drops new chunks, the rule fires
+# and starts a Bedrock KB ingestion job — no operator click required.
 
 resource "aws_s3_bucket_notification" "data_eventbridge" {
   bucket      = aws_s3_bucket.data.id
@@ -90,14 +89,12 @@ resource "aws_s3vectors_index" "kb" {
   #      as filterable attributes. A single ~500-token chunk alone blows
   #      the budget. AWS requires both of these marked non-filterable
   #      when using S3 Vectors as the KB vector store.
-  # source / section / chunkId / chunkType / corpus stay filterable so the
+  # source / section / chunkId / chunkType stay filterable so the
   # backend can:
   #   - scope retrieval to one statute  (source = "Employment Act 2007")
   #   - drop table-of-contents chunks   (chunkType != "toc") — Phase 1
-  #   - split FAQ vs. statute corpora   (corpus = "faq" / "statute") — Phase 4a
-  # category and url stay filterable too; they're short and rarely hit the
-  # 2048 byte limit for SheriaPlex/KenyaLaw entries. Long free-text
-  # attributes (chapter/title/pageImageKey) remain non-filterable.
+  # Long free-text attributes (chapter/title/pageImageKey) remain
+  # non-filterable to stay under the 2048 byte per-vector cap.
   metadata_configuration {
     non_filterable_metadata_keys = [
       "AMAZON_BEDROCK_METADATA",

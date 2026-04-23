@@ -133,8 +133,8 @@ Examples:
 
 # ── Supervisor router prompt (Phase 2 multi-agent) ───────────────────────────
 # Picks one or more specialist agents for the latest user turn. Returns a list
-# so cross-cutting questions like "can my landlord evict me without notice?"
-# can fan out to {land + faq} specialists in parallel.
+# so cross-cutting questions like "what are my constitutional rights at work?"
+# can fan out to {employment + constitution} specialists in parallel.
 
 SUPERVISOR_PROMPT = """You are a routing supervisor for a Kenyan legal aid chatbot.
 
@@ -147,9 +147,6 @@ statute touches. Trust the retrieval layer to find the relevant section.
 2010 (any chapter, any article).
   - "employment"   — any question answerable from the Employment Act 2007.
   - "land"         — any question answerable from the Land Act 2012.
-  - "faq"          — procedural / practical "how do I..." questions commonly \
-asked of lawyers that need a lay walkthrough rather than a specific statute. \
-Pair with a specialist when the question also has a clear statutory basis.
   - "chat"         — conversational / off-topic / memory lookups \
 (greetings, "my name is X", "what is my name", thanks, small talk, questions \
 about other jurisdictions or unrelated domains). NEVER combine "chat" with \
@@ -161,8 +158,7 @@ Respond with exactly one JSON object and nothing else:
 Rules:
 - "agents" is a non-empty list of 1–3 entries from the set above.
 - Pick multiple agents ONLY for genuinely cross-cutting questions (e.g. a \
-question that touches employment + constitutional rights, or a statute \
-question that also needs practical "how do I" context). Prefer a single \
+question that touches employment + constitutional rights). Prefer a single \
 specialist when one is clearly sufficient.
 - **Focus on the LATEST user message, not the conversation history.** Prior \
 small-talk turns MUST NOT bias you toward "chat" if the newest message asks \
@@ -175,8 +171,7 @@ Examples (illustrative — do NOT treat the listed topics as exhaustive):
   U: "My name is Dave"                                 -> {"agents": ["chat"], "reason": "user intro"}
   U: "What does section 40 of the Employment Act say?" -> {"agents": ["employment"], "reason": "specific statute"}
   U: "What rights do I have under the Constitution?"   -> {"agents": ["constitution"], "reason": "constitution question"}
-  U: "Can my landlord evict me without notice?"        -> {"agents": ["land", "faq"], "reason": "statute + practical procedure"}
-  U: "How do I file a labour case?"                    -> {"agents": ["faq", "employment"], "reason": "procedural + employment"}
+  U: "Can my landlord evict me without notice?"        -> {"agents": ["land"], "reason": "land statute"}
   U: "What is public land in Kenya?"                   -> {"agents": ["land"], "reason": "land statute"}
   U: "Thanks!"                                         -> {"agents": ["chat"], "reason": "acknowledgement"}
   U: "How's the weather?"                              -> {"agents": ["chat"], "reason": "off-topic"}

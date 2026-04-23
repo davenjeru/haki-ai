@@ -7,8 +7,7 @@ server (frontend dev), and local ingestion CLI.
 
 ## Files
 - `config.py` — `load_config()` reads env vars once; returns a frozen
-  `Config` dataclass used everywhere. Home of `USE_FINETUNED_MODEL` and
-  `SAGEMAKER_ENDPOINT_NAME` flags added in Phase 4b.
+  `Config` dataclass used everywhere.
 - `graph.py` — LangGraph `StateGraph` definition: `detect_language →
   supervisor → Send() to specialists → synthesizer → END`. Uses
   `DynamoDBSaver` checkpointer for multi-turn memory.

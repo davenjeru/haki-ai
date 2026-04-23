@@ -19,11 +19,10 @@
 ############################################################
 
 locals {
-  # Prefixes we watch. Any object created under either of these
-  # triggers a (debounced) ingestion.
+  # Prefixes we watch. Any object created under these triggers a
+  # (debounced) ingestion.
   ingestion_watch_prefixes = [
     "processed-chunks/",
-    "faq-chunks/",
   ]
 
   enable_ingestion_trigger = var.ingestion_kb_id != "" && var.ingestion_data_source_id != ""
@@ -92,9 +91,9 @@ data "archive_file" "ingestion_trigger_zip" {
       Auto-ingestion trigger for the Haki AI Bedrock KB.
 
       Invoked by an EventBridge rule on S3 object-created events under
-      processed-chunks/* and faq-chunks/*. The rule batches events for
-      five minutes so a pipeline run that uploads many chunks only fires
-      a single ingestion job.
+      processed-chunks/*. The rule batches events for five minutes so a
+      pipeline run that uploads many chunks only fires a single ingestion
+      job.
 
       We check for IN_PROGRESS / STARTING jobs before starting a new one;
       Bedrock rejects overlapping jobs anyway, but the explicit check
@@ -167,7 +166,7 @@ resource "aws_cloudwatch_event_rule" "ingestion_trigger" {
   count = local.enable_ingestion_trigger ? 1 : 0
 
   name        = "${var.project_name}-ingestion-trigger"
-  description = "Batches S3 uploads under processed-chunks/ and faq-chunks/ into a single ingestion run."
+  description = "Batches S3 uploads under processed-chunks/ into a single ingestion run."
 
   event_pattern = jsonencode({
     source        = ["aws.s3"]

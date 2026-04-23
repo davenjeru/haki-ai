@@ -8,12 +8,13 @@ scoped to its own law. A synthesizer merges multi-specialist answers.
 
 ## Files
 - `supervisor.py` — Haiku JSON router. Emits
-  `{"agents": ["employment", "faq"], "reason": "..."}`. Falls back to
-  the FAQ specialist on malformed output so the graph never dead-ends.
+  `{"agents": ["employment", "constitution"], "reason": "..."}`.
+  Falls back to the chat path on malformed output so the graph never
+  dead-ends.
 - `specialists.py` — factory for `ConstitutionAgent`, `EmploymentAgent`,
-  `LandAgent`, `FAQAgent`. Each scopes the RAG pipeline by `source` or
-  `corpus` metadata filter and returns `{response_text, citations,
-  blocked, stop_reason}`.
+  `LandAgent`. Each scopes the RAG pipeline by a `source` metadata
+  filter and returns `{response_text, citations, blocked,
+  stop_reason}`.
 - `chat.py` — conversational (no-RAG) path. Direct Claude
   `invoke_model` call with history — used when `supervisor` routes to
   `chat`. Zero citations by design.
@@ -34,11 +35,9 @@ flowchart TB
   fan --> c[ConstitutionAgent]
   fan --> e[EmploymentAgent]
   fan --> l[LandAgent]
-  fan --> f[FAQAgent]
   c --> syn[synthesizer.merge]
   e --> syn
   l --> syn
-  f --> syn
   syn --> out[merged answer + citations]
   chat --> out
 ```

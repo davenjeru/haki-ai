@@ -46,7 +46,7 @@ def get_index(catalog: list[dict], cache_key: str = "default") -> tuple["BM25Oka
     """
     Returns a cached (BM25, catalog) pair for the given cache_key, building
     lazily on first access. The cache_key lets us hold separate indexes for
-    different corpora (e.g. FAQ vs statute) without clashing.
+    different catalogs without clashing.
     """
     cached = _cached.get(cache_key)
     if cached is not None:

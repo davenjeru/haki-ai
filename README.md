@@ -48,8 +48,8 @@ haki-ai/
 ├── backend/       Python Lambda handler, LangGraph agents, RAG pipeline, evals
 ├── frontend/      Vite + React + Tailwind single-page app
 ├── pipeline/      Node.js statute ingestion pipeline (download → OCR → chunk → upload)
-├── infra/         Terraform (S3, DynamoDB, Lambda, Bedrock KB, SageMaker, CloudFront)
-├── scripts/       bootstrap.sh (state bucket), run-finetune.sh (SageMaker job)
+├── infra/         Terraform (S3, DynamoDB, Lambda, Bedrock KB, CloudFront)
+├── scripts/       bootstrap.sh (state bucket)
 └── CLAUDE.md      System-wide context for the AI assistant working on this repo
 ```
 
@@ -68,15 +68,12 @@ flowchart LR
   LG --> S1[ConstitutionAgent]
   LG --> S2[EmploymentAgent]
   LG --> S3[LandAgent]
-  LG --> S4[FAQAgent]
   LG --> CH[ChatAgent]
-  S1 & S2 & S3 & S4 --> RAG[RAG pipeline]
+  S1 & S2 & S3 --> RAG[RAG pipeline]
   RAG --> KB[Bedrock KB<br/>S3 Vectors]
   RAG --> BM[BM25 in-memory]
   RAG --> RR[Cohere Rerank 3.5]
-  RAG --> GEN{Generate}
-  GEN -->|default| CL[Claude on Bedrock]
-  GEN -->|USE_FINETUNED_MODEL| SM[SageMaker: fine-tuned Llama-3.1-8B]
+  RAG --> GEN[Claude on Bedrock]
   L --> DDB[DynamoDB checkpointer]
   L --> CW[CloudWatch metrics/alarms]
   L --> LS[LangSmith traces]

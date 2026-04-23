@@ -6,7 +6,7 @@ Two-tier design:
   Tier 1 (Supervisor)
     `supervisor.py` routes each user turn to one or more specialists based
     on a cheap Haiku call. Possible specialists: constitution, employment,
-    land, faq, chat.
+    land, chat.
 
   Tier 2 (Specialist sub-agents)
     Each specialist is a compiled LangGraph subgraph that runs the Phase 1

@@ -1240,8 +1240,10 @@ class TestSupervisorParsing(unittest.TestCase):
         self.assertEqual(reason, "notice")
 
     def test_parses_multiple_agents(self):
-        agents, _ = _parse_routing('{"agents": ["land", "faq"], "reason": "eviction + procedure"}')
-        self.assertEqual(agents, ["land", "faq"])
+        agents, _ = _parse_routing(
+            '{"agents": ["land", "constitution"], "reason": "land + rights"}'
+        )
+        self.assertEqual(agents, ["land", "constitution"])
 
     def test_chat_is_exclusive(self):
         agents, _ = _parse_routing('{"agents": ["chat", "employment"]}')
@@ -1253,7 +1255,7 @@ class TestSupervisorParsing(unittest.TestCase):
 
     def test_caps_at_three_agents(self):
         agents, _ = _parse_routing(
-            '{"agents": ["constitution", "employment", "land", "faq"]}'
+            '{"agents": ["constitution", "employment", "land", "tax"]}'
         )
         self.assertEqual(len(agents), 3)
 
@@ -1899,76 +1901,6 @@ class TestEmitMetrics(unittest.TestCase):
     def test_missing_citations_not_recorded_when_citations_present(self):
         names = self._emit(blocked=False, citations=[{"source": "x"}])
         self.assertNotIn("MissingCitations", names)
-
-
-class TestSageMakerGenerator(unittest.TestCase):
-    """Phase 4b — fine-tuned Llama endpoint invocation + Bedrock fallback."""
-
-    def test_generate_returns_end_turn_on_normal_response(self):
-        from rag.sagemaker_generator import generate
-
-        class _Rt:
-            def __init__(self):
-                self.last_call = None
-
-            def invoke_endpoint(self, **kwargs):
-                self.last_call = kwargs
-                payload = [{"generated_text": "Yes, under Section 40."}]
-                return {"Body": io.BytesIO(json.dumps(payload).encode())}
-
-        rt = _Rt()
-        text, stop = generate(
-            query="Is notice required?",
-            system_prompt="You are Haki AI.",
-            context="Section 40 of the Employment Act ...",
-            endpoint_name="haki-ai-finetuned",
-            sagemaker_runtime=rt,
-        )
-        self.assertEqual(text, "Yes, under Section 40.")
-        self.assertEqual(stop, "end_turn")
-        self.assertEqual(rt.last_call["EndpointName"], "haki-ai-finetuned")
-        body = json.loads(rt.last_call["Body"])
-        self.assertIn("<|start_header_id|>user<|end_header_id|>", body["inputs"])
-        self.assertIn("<context>", body["inputs"])
-
-    def test_bedrock_adapter_falls_back_on_sagemaker_error(self):
-        from clients.adapters import BedrockRAGAdapter
-
-        class _FakeConfig:
-            use_finetuned_model = True
-            sagemaker_endpoint_name = "haki-ai-finetuned"
-            guardrail_id = ""
-            guardrail_version = ""
-            knowledge_base_id = ""
-            aws_region = "us-east-1"
-            s3_bucket = "b"
-
-        class _SmRuntime:
-            def invoke_endpoint(self, **_):
-                raise RuntimeError("cold start timeout")
-
-        fallback_hits = []
-
-        class _BedrockRuntime:
-            def invoke_model(self, **kwargs):
-                fallback_hits.append(kwargs)
-                payload = {"content": [{"text": "fallback answer"}], "stop_reason": "end_turn"}
-                return {"body": io.BytesIO(json.dumps(payload).encode())}
-
-        adapter = BedrockRAGAdapter(
-            bedrock_agent_runtime=object(),
-            bedrock_runtime=_BedrockRuntime(),
-            config=_FakeConfig(),
-            s3_client=object(),
-            sagemaker_runtime=_SmRuntime(),
-        )
-
-        text, stop = adapter.generate(
-            query="q", system_prompt="s", context="c", model_id="claude-haiku"
-        )
-        self.assertEqual(text, "fallback answer")
-        self.assertEqual(stop, "end_turn")
-        self.assertEqual(len(fallback_hits), 1)
 
 
 # ── Retrieval audit ───────────────────────────────────────────────────────────

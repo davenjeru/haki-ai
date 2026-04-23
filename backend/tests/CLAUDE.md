@@ -8,9 +8,8 @@ LocalStack and are opt-in.
 ## Files
 - `test_unit.py` — 126 unit tests covering classifier, supervisor
   parsing, RAG pipeline stages (query expansion, RRF, rerank,
-  filters, citations), SageMaker generator fallback, synthesizer,
-  LangSmith bootstrap, and the Lambda handler against a stubbed
-  compiled graph.
+  filters, citations), synthesizer, LangSmith bootstrap, and the
+  Lambda handler against a stubbed compiled graph.
 - `test_e2e_local.py` — in-process end-to-end RAG against the local
   ChromaDB + real Bedrock. Requires `.local-vectorstore/` hydrated
   via `make ingest-local`.

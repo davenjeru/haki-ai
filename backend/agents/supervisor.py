@@ -3,7 +3,7 @@ Supervisor router \u2014 tier 1 of the two-tier agent system.
 
 Given the conversation so far, a single Haiku call returns a JSON object
 like:
-    {"agents": ["employment", "faq"], "reason": "labour + procedural"}
+    {"agents": ["employment"], "reason": "labour question"}
 
 The supervisor never produces the user-facing answer itself; it only
 decides who handles the turn. A dedicated router prompt (prompts.SUPERVISOR_PROMPT)
@@ -41,7 +41,7 @@ from prompts import SUPERVISOR_PROMPT
 
 
 # Canonical agent names the supervisor may select. Anything else is dropped.
-KNOWN_AGENTS = frozenset({"constitution", "employment", "land", "faq", "chat"})
+KNOWN_AGENTS = frozenset({"constitution", "employment", "land", "chat"})
 
 # Fallback when the model returns nothing we can use. ``chat`` is the only
 # safe default: it replies conversationally / bilingually-refuses for

@@ -1,7 +1,7 @@
 """
 Specialist agents \u2014 tier 2 of the two-tier system.
 
-Each specialist wraps the Phase 1 advanced-RAG pipeline with a corpus
+Each specialist wraps the Phase 1 advanced-RAG pipeline with a source
 filter and a display name. Specialists share the same build function so
 adding a new statute (e.g. Marriage Act) is a one-line addition to
 `AGENT_REGISTRY`.
@@ -10,10 +10,6 @@ Agents:
   - constitution  \u2192 filter(source=\"Constitution of Kenya 2010\")
   - employment    \u2192 filter(source=\"Employment Act 2007\")
   - land          \u2192 filter(source=\"Land Act 2012\")
-  - faq           \u2192 filter(corpus=\"faq\") \u2014 Phase 4a populates this corpus
-                    from SheriaPlex Q&As + KenyaLaw case summaries. Until
-                    the FAQ corpus exists, the agent falls back to the
-                    full KB unfiltered so it still produces answers.
   - chat          \u2192 does NOT use RAG; runs chat_node.invoke_chat.
 
 A specialist call returns:
@@ -85,15 +81,6 @@ AGENT_REGISTRY: dict[str, dict] = {
     "land": {
         "display_name": "Land",
         "filter": {"source": "Land Act 2012"},
-    },
-    "faq": {
-        "display_name": "FAQ",
-        # Phase 4a populates faq-chunks/ with crawled SheriaPlex Q&A and
-        # KenyaLaw case summaries, all tagged corpus="faq" in S3 sidecar
-        # metadata. Filtering retrieval on corpus="faq" keeps this
-        # specialist focused on lay/procedural answers while the statute
-        # specialists handle Act/Constitution lookups via `source` filters.
-        "filter": {"corpus": "faq"},
     },
     "chat": {
         "display_name": "Chat",

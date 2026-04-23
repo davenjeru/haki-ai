@@ -9,14 +9,13 @@ Business logic elsewhere never calls `boto3.client(...)` directly.
 ## Files
 - `__init__.py` — `make_comprehend`, `make_bedrock_runtime`,
   `make_bedrock_agent_runtime`, `make_cloudwatch`, `make_dynamodb_*`,
-  `make_ssm`, `make_s3`, `make_sagemaker_runtime`. Each honours
-  `ENV=local` to route through LocalStack.
+  `make_ssm`, `make_s3`. Each honours `ENV=local` to route through
+  LocalStack.
 - `adapters.py` — wraps raw clients with a friendlier interface:
   - `ComprehendAdapter` — language detection; falls back to `english`
     if Comprehend is unavailable (LocalStack).
   - `BedrockRAGAdapter` — prod retrieval: Bedrock KB `retrieve` +
-    `rag.pipeline.run_pipeline` on top. Holds optional SageMaker
-    client + flag to route generation to the fine-tuned endpoint.
+    `rag.pipeline.run_pipeline` on top.
   - `LocalRAGAdapter` — dev retrieval: ChromaDB (HTTP or in-process)
     returns Bedrock-KB-shaped results so the pipeline is identical.
 
@@ -30,10 +29,8 @@ flowchart LR
   f --> lo[LocalRAGAdapter]
   f --> cw[CloudWatch client]
   f --> ddb[DynamoDB client]
-  f --> sm[SageMaker runtime]
   br --> rag[rag.pipeline]
   lo --> rag
-  sm -.optional.-> rag
 ```
 
 ## Conventions

@@ -24,13 +24,6 @@ export interface Chunk {
   //                     retrieval. Re-enable per-query if we add a
   //                     "what does X mean" intent.
   chunkType: "body" | "toc" | "preamble" | "short-title" | "definitions";
-  // "statute" for chunks derived from Act/Constitution PDFs (default), "faq"
-  // for crawled Q&A content (SheriaPlex, KenyaLaw summaries). Bedrock KB uses
-  // this to route queries: the FAQAgent filters on corpus="faq" while the
-  // statute specialists filter on source=<Act name> (corpus=statute implied).
-  corpus?: "statute" | "faq";
-  category?: string;     // FAQ-only: SheriaPlex category (e.g. "Employment")
-  url?: string;          // FAQ-only: original Q&A URL for attribution
 }
 
 // ── Noise filtering ───────────────────────────────────────────────────────────
