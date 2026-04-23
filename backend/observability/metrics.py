@@ -9,7 +9,11 @@ Metrics emitted per request:
   - ResponseLatency (milliseconds)
   - DetectedLanguage_english / _swahili / _mixed (count)
   - GuardrailBlock (count, only when blocked=True)
-  - MissingCitations (count, only when citations=[])
+  - MissingCitations (count, only when citations=[] AND not blocked)
+
+MissingCitations deliberately ignores blocked turns: refusals are expected
+to have zero citations, so counting them would turn a healthy off-topic
+refusal into a false-positive retrieval-quality signal.
 
 When is_local=True the CloudWatch client points at LocalStack. LocalStack
 supports PutMetricData, so metrics are emitted in both environments.
@@ -50,7 +54,7 @@ def emit_metrics(
     if blocked:
         metric_data.append(_count("GuardrailBlock"))
 
-    if not citations:
+    if not citations and not blocked:
         metric_data.append(_count("MissingCitations"))
 
     cloudwatch.put_metric_data(Namespace=NAMESPACE, MetricData=metric_data)
