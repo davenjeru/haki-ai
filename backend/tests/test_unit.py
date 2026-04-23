@@ -29,8 +29,10 @@ from rag.pipeline import run_rag
 from rag.query_expansion import _parse_variants, expand_query
 from agents.supervisor import _parse_routing, route_supervisor
 from agents.synthesizer import _dedup_citations, synthesize
+from evals.audit import AuditRow, classify, format_report
 from evals.llm_judge import AXES, _parse_judge_response, judge
-from evals.loader import load_golden_set
+from evals.loader import GoldenCase, load_golden_set
+from evals.runner import EvalResult
 from evals.report import (
     CaseScore,
     _aggregate_judge,
@@ -1052,6 +1054,61 @@ class TestFilters(unittest.TestCase):
         out = rag_filters.dedup_by_section(results)
         self.assertEqual([r["metadata"]["chunkId"] for r in out], ["a", "c"])
 
+    # ── drop_boilerplate ────────────────────────────────────────────────
+    # Preamble / Section 1 / Section 2 chunks were over-retrieved in the
+    # Land Act baseline (see plan §5b). drop_boilerplate removes them by
+    # chunkType and by the legacy heuristic fallback for un-retagged
+    # corpora.
+
+    def test_drop_boilerplate_explicit_chunktype(self):
+        results = [
+            self._entry(chunkType="body", section="Section 40"),
+            self._entry(chunkType="preamble", section="Preamble"),
+            self._entry(chunkType="short-title", section="Section 1"),
+            self._entry(chunkType="definitions", section="Section 2"),
+            self._entry(chunkType="toc", section="Arrangement"),
+        ]
+        kept = rag_filters.drop_boilerplate(results)
+        sections = [r["metadata"]["section"] for r in kept]
+        # TOC is not boilerplate — drop_boilerplate only handles preamble /
+        # short-title / definitions. The existing drop_toc filter handles TOC.
+        self.assertEqual(sections, ["Section 40", "Arrangement"])
+
+    def test_drop_boilerplate_heuristic_fallback(self):
+        # Chunks ingested before chunkType was introduced should still be
+        # dropped based on (section, title) heuristics.
+        results = [
+            self._entry(section="Preamble", title=""),
+            self._entry(section="Section 1", title="Short title"),
+            self._entry(section="Section 2", title="Interpretation"),
+            self._entry(section="Section 2", title="Definitions"),
+            self._entry(section="Section 40", title="Termination"),
+        ]
+        kept = rag_filters.drop_boilerplate(results)
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(kept[0]["metadata"]["section"], "Section 40")
+
+    def test_drop_boilerplate_ignores_unrelated_section_titles(self):
+        # "Section 1" with a non-boilerplate title (e.g. a renumbered Act)
+        # must NOT be dropped by the heuristic. Only section+title pairs
+        # that actually look like boilerplate qualify.
+        results = [
+            self._entry(section="Section 1", title="Rights of a child"),
+            self._entry(section="Section 2", title="Duty of care"),
+        ]
+        kept = rag_filters.drop_boilerplate(results)
+        self.assertEqual(len(kept), 2)
+
+    def test_is_boilerplate_accepts_flat_metadata(self):
+        # Audit passes plain metadata dicts (no "metadata" wrapper) out of
+        # EvalResult.retrieved_metadata. The helper must handle both.
+        self.assertTrue(rag_filters.is_boilerplate({"chunkType": "preamble"}))
+        self.assertTrue(
+            rag_filters.is_boilerplate({"section": "Section 2", "title": "Interpretation"})
+        )
+        self.assertFalse(rag_filters.is_boilerplate({"chunkType": "body"}))
+        self.assertFalse(rag_filters.is_boilerplate({}))
+
 
 class _StubAdapter:
     """
@@ -1202,11 +1259,15 @@ class TestSupervisorParsing(unittest.TestCase):
 
     def test_malformed_json_falls_back(self):
         agents, _ = _parse_routing("not json at all")
-        self.assertEqual(agents, ["employment"])
+        # We fall back to "chat" (not a statute specialist) so the app
+        # bilingually-refuses / converses instead of hallucinating citations
+        # when the router's JSON is corrupt. See
+        # backend/agents/supervisor.py::_FALLBACK for the rationale.
+        self.assertEqual(agents, ["chat"])
 
     def test_empty_agents_falls_back(self):
         agents, _ = _parse_routing('{"agents": []}')
-        self.assertEqual(agents, ["employment"])
+        self.assertEqual(agents, ["chat"])
 
 
 class TestSupervisorPromptContent(unittest.TestCase):
@@ -1280,7 +1341,59 @@ class TestRouteSupervisor(unittest.TestCase):
             _Broken(),
             "haiku",
         )
-        self.assertEqual(agents, ["employment"])
+        # Regression: the fallback used to be ["employment"] which caused
+        # conversational turns (e.g. "Naitwa nani?") to be answered by the
+        # employment specialist whenever Bedrock throttled. ``chat`` is the
+        # only safe default.
+        self.assertEqual(agents, ["chat"])
+        self.assertEqual(reason, "bedrock_error")
+
+    def test_retries_bedrock_once_before_falling_back(self):
+        # Haiku 4.5 has a 10 RPM account quota and transient
+        # ThrottlingException was the proximate cause of the "Naitwa nani?"
+        # routing failure. One cheap retry meaningfully reduces the
+        # fallback rate without materially increasing happy-path latency.
+        class _FlakyOnce:
+            def __init__(self):
+                self.calls = 0
+
+            def invoke_model(self, *, modelId, body, contentType, accept):
+                self.calls += 1
+                if self.calls == 1:
+                    raise RuntimeError("ThrottlingException")
+                payload = json.dumps({
+                    "content": [{"text": '{"agents": ["chat"], "reason": "conv"}'}],
+                    "stop_reason": "end_turn",
+                }).encode()
+                return {"body": io.BytesIO(payload)}
+
+        br = _FlakyOnce()
+        agents, reason = route_supervisor(
+            [{"role": "user", "content": "Naitwa nani?"}],
+            br,
+            "haiku",
+        )
+        self.assertEqual(br.calls, 2, "expected exactly one retry")
+        self.assertEqual(agents, ["chat"])
+        self.assertEqual(reason, "conv")
+
+    def test_gives_up_after_exhausting_retries(self):
+        class _AlwaysBroken:
+            def __init__(self):
+                self.calls = 0
+
+            def invoke_model(self, **_):
+                self.calls += 1
+                raise RuntimeError("ThrottlingException")
+
+        br = _AlwaysBroken()
+        agents, reason = route_supervisor(
+            [{"role": "user", "content": "hi"}],
+            br,
+            "haiku",
+        )
+        self.assertGreaterEqual(br.calls, 2)
+        self.assertEqual(agents, ["chat"])
         self.assertEqual(reason, "bedrock_error")
 
 
@@ -1608,6 +1721,186 @@ class TestReportWriter(unittest.TestCase):
         self.assertIn("faithfulness", body)
 
 
+# ── Evals: retrieval metrics ──────────────────────────────────────────────────
+
+class TestRetrievalMetrics(unittest.TestCase):
+    """Recall@k / MRR@k over post-rerank chunks."""
+
+    def _result(
+        self,
+        *,
+        language: str,
+        expected_sections: list[str],
+        chunks: list[tuple[str, dict]],
+    ):
+        from evals.loader import GoldenCase
+        from evals.runner import EvalResult
+
+        case = GoldenCase(
+            id="test",
+            category="constitution",
+            question="Q?",
+            reference_answer="R.",
+            expected_sources=["Source"],
+            expected_sections=expected_sections,
+            language=language,
+        )
+        return EvalResult(
+            case=case,
+            answer="A",
+            citations=[],
+            retrieved_contexts=[text for text, _ in chunks],
+            retrieved_metadata=[meta for _, meta in chunks],
+        )
+
+    def test_recall_hits_when_section_in_metadata(self):
+        from evals.retrieval_metrics import chunk_recall_at_k
+
+        r = self._result(
+            language="english",
+            expected_sections=["Article 174"],
+            chunks=[
+                ("body text", {"section": "Article 174", "chapter": "Chapter 11"}),
+                ("other", {"section": "Article 160"}),
+            ],
+        )
+        self.assertEqual(chunk_recall_at_k(r, k=5), 1.0)
+
+    def test_recall_hits_when_section_in_chunk_text(self):
+        from evals.retrieval_metrics import chunk_recall_at_k
+
+        r = self._result(
+            language="swahili",
+            expected_sections=["Section 35"],
+            chunks=[
+                ("Kifungu cha Section 35 kinasema...", {}),
+            ],
+        )
+        self.assertEqual(chunk_recall_at_k(r, k=5), 1.0)
+
+    def test_recall_zero_when_no_match(self):
+        from evals.retrieval_metrics import chunk_recall_at_k
+
+        r = self._result(
+            language="english",
+            expected_sections=["Article 174"],
+            chunks=[("text about article 160", {"section": "Article 160"})],
+        )
+        self.assertEqual(chunk_recall_at_k(r, k=5), 0.0)
+
+    def test_recall_partial_across_multi_section_case(self):
+        from evals.retrieval_metrics import chunk_recall_at_k
+
+        r = self._result(
+            language="english",
+            expected_sections=["Article 43", "Article 53"],
+            chunks=[("body", {"section": "Article 43"})],
+        )
+        self.assertEqual(chunk_recall_at_k(r, k=5), 0.5)
+
+    def test_recall_returns_none_when_no_expected_sections(self):
+        from evals.retrieval_metrics import chunk_recall_at_k
+
+        r = self._result(language="english", expected_sections=[], chunks=[("x", {})])
+        self.assertIsNone(chunk_recall_at_k(r, k=5))
+
+    def test_recall_respects_k_cutoff(self):
+        from evals.retrieval_metrics import chunk_recall_at_k
+
+        r = self._result(
+            language="english",
+            expected_sections=["Article 174"],
+            chunks=[
+                ("noise", {"section": "Article 160"}),
+                ("noise", {"section": "Article 161"}),
+                ("body", {"section": "Article 174"}),
+            ],
+        )
+        self.assertEqual(chunk_recall_at_k(r, k=2), 0.0)
+        self.assertEqual(chunk_recall_at_k(r, k=3), 1.0)
+
+    def test_mrr_uses_first_matching_rank(self):
+        from evals.retrieval_metrics import mrr_at_k
+
+        r = self._result(
+            language="english",
+            expected_sections=["Section 40"],
+            chunks=[
+                ("noise", {"section": "Section 44"}),
+                ("noise", {"section": "Section 45"}),
+                ("body", {"section": "Section 40"}),
+            ],
+        )
+        self.assertAlmostEqual(mrr_at_k(r, k=10), 1.0 / 3)
+
+    def test_mrr_zero_when_no_match_within_k(self):
+        from evals.retrieval_metrics import mrr_at_k
+
+        r = self._result(
+            language="english",
+            expected_sections=["Article 174"],
+            chunks=[("noise", {"section": "Article 160"})],
+        )
+        self.assertEqual(mrr_at_k(r, k=5), 0.0)
+
+    def test_summarize_stratifies_by_language(self):
+        from evals.retrieval_metrics import summarize_retrieval
+
+        en_hit = self._result(
+            language="english",
+            expected_sections=["Article 10"],
+            chunks=[("body", {"section": "Article 10"})],
+        )
+        sw_miss = self._result(
+            language="swahili",
+            expected_sections=["Article 10"],
+            chunks=[("noise", {"section": "Article 99"})],
+        )
+        report = summarize_retrieval([en_hit, sw_miss])
+
+        self.assertEqual(report.case_count, 2)
+        self.assertAlmostEqual(report.recall_at_k, 0.5)
+        self.assertAlmostEqual(report.by_language["english"]["recall_at_k"], 1.0)
+        self.assertAlmostEqual(report.by_language["swahili"]["recall_at_k"], 0.0)
+
+
+# ── Observability: MissingCitations suppression on blocked turns ─────────────
+
+class TestEmitMetrics(unittest.TestCase):
+
+    class _FakeCloudWatch:
+        def __init__(self):
+            self.calls = []
+
+        def put_metric_data(self, **kwargs):
+            self.calls.append(kwargs)
+
+    def _emit(self, **kwargs):
+        from observability.metrics import emit_metrics
+
+        cw = self._FakeCloudWatch()
+        emit_metrics(cw, language="english", latency_ms=1.0, **kwargs)
+        return [m["MetricName"] for m in cw.calls[0]["MetricData"]]
+
+    def test_missing_citations_recorded_when_not_blocked(self):
+        names = self._emit(blocked=False, citations=[])
+        self.assertIn("MissingCitations", names)
+
+    def test_missing_citations_skipped_on_blocked_turn(self):
+        names = self._emit(blocked=True, citations=[])
+        self.assertIn("GuardrailBlock", names)
+        self.assertNotIn(
+            "MissingCitations",
+            names,
+            "Refusals have no citations by design; counting them turns a "
+            "healthy refusal into a false-positive retrieval-quality signal.",
+        )
+
+    def test_missing_citations_not_recorded_when_citations_present(self):
+        names = self._emit(blocked=False, citations=[{"source": "x"}])
+        self.assertNotIn("MissingCitations", names)
+
+
 class TestSageMakerGenerator(unittest.TestCase):
     """Phase 4b — fine-tuned Llama endpoint invocation + Bedrock fallback."""
 
@@ -1678,6 +1971,284 @@ class TestSageMakerGenerator(unittest.TestCase):
         self.assertEqual(len(fallback_hits), 1)
 
 
+# ── Retrieval audit ───────────────────────────────────────────────────────────
+
+
+class TestAuditClassify(unittest.TestCase):
+    """
+    Unit tests for evals.audit.classify — the per-case triage that
+    decides whether a golden miss is caused by boilerplate pollution
+    (fixable via chunk hygiene), a genuine rerank loss, or whether the
+    case has no expected sections to score against.
+    """
+
+    def _case(self, *, case_id="x-01", expected=None, language="english") -> GoldenCase:
+        return GoldenCase(
+            id=case_id,
+            category="land",
+            question="q",
+            reference_answer="ref",
+            expected_sources=["Land Act 2012"],
+            expected_sections=list(expected or []),
+            language=language,
+        )
+
+    def _result(self, case: GoldenCase, *, retrieved_metas: list[dict]) -> EvalResult:
+        return EvalResult(
+            case=case,
+            answer="",
+            citations=[],
+            retrieved_contexts=[""] * len(retrieved_metas),
+            retrieved_metadata=retrieved_metas,
+        )
+
+    def test_hit_when_expected_section_retrieved(self):
+        case = self._case(expected=["Section 5"])
+        result = self._result(case, retrieved_metas=[
+            {"section": "Section 5", "chunkType": "body"},
+            {"section": "Section 6", "chunkType": "body"},
+        ])
+        row = classify(result, top_k=5)
+        self.assertEqual(row.failure_mode, "hit")
+        self.assertEqual(row.matched, ["Section 5"])
+        self.assertEqual(row.boilerplate_slots, 0)
+
+    def test_noise_pollution_flags_boilerplate_slot(self):
+        # Expected section not in top-K AND boilerplate (preamble /
+        # short-title / definitions) occupies at least one slot — classic
+        # land-01/04/08 failure mode.
+        case = self._case(expected=["Section 54"])
+        result = self._result(case, retrieved_metas=[
+            {"section": "Preamble", "chunkType": "preamble"},
+            {"section": "Section 1", "chunkType": "short-title"},
+            {"section": "Section 65", "chunkType": "body"},
+        ])
+        row = classify(result, top_k=5)
+        self.assertEqual(row.failure_mode, "noise-pollution")
+        self.assertEqual(row.boilerplate_slots, 2)
+        self.assertEqual(row.matched, [])
+
+    def test_rerank_loss_when_no_boilerplate_and_no_hit(self):
+        # Expected section missing AND every top-K slot is a real body
+        # chunk → diagnosis is "rerank pushed the right chunk out", not
+        # chunk hygiene. Actionable for plan step 7 / 8.
+        case = self._case(expected=["Section 85"])
+        result = self._result(case, retrieved_metas=[
+            {"section": "Section 86", "chunkType": "body"},
+            {"section": "Section 91", "chunkType": "body"},
+        ])
+        row = classify(result, top_k=5)
+        self.assertEqual(row.failure_mode, "rerank-loss")
+        self.assertEqual(row.boilerplate_slots, 0)
+
+    def test_no_expected_is_skipped_from_scoring(self):
+        # Refusal rows and open-ended questions have no expected sections;
+        # audit must flag them so they don't distort aggregate rates.
+        case = self._case(expected=[])
+        result = self._result(case, retrieved_metas=[
+            {"section": "Section 1", "chunkType": "short-title"},
+        ])
+        row = classify(result, top_k=5)
+        self.assertEqual(row.failure_mode, "no-expected")
+
+    def test_top_k_cutoff_respected(self):
+        # Expected section only present at rank 6 must NOT register as a
+        # hit when top_k=5; otherwise the audit would paper over reranker
+        # weaknesses.
+        case = self._case(expected=["Section 99"])
+        metas = [
+            {"section": f"Section {i}", "chunkType": "body"} for i in range(10, 15)
+        ] + [{"section": "Section 99", "chunkType": "body"}]
+        result = self._result(case, retrieved_metas=metas)
+        row = classify(result, top_k=5)
+        self.assertEqual(row.failure_mode, "rerank-loss")
+        self.assertEqual(row.matched, [])
+
+    def test_chunkid_substring_match_for_legacy_rows(self):
+        # Some golden rows expect section ranges (e.g. "Section 107-133");
+        # falling back to chunkId substring match lets the audit catch
+        # hits even when the exact section string differs.
+        case = self._case(expected=["107"])
+        result = self._result(case, retrieved_metas=[
+            {"section": "Section 107", "chunkId": "land-act-2012-part-viii-section-107"},
+        ])
+        row = classify(result, top_k=5)
+        self.assertEqual(row.failure_mode, "hit")
+
+    def test_format_report_renders_summary_and_table(self):
+        # Smoke test: format_report must produce a non-empty markdown
+        # string containing the headline counts and a row per case.
+        rows = [
+            AuditRow(
+                case_id="x-01",
+                language="english",
+                expected_sections=["Section 5"],
+                retrieved_sections=["Section 5"],
+                retrieved_chunk_types=["body"],
+                boilerplate_slots=0,
+                matched=["Section 5"],
+                failure_mode="hit",
+            ),
+            AuditRow(
+                case_id="x-02",
+                language="swahili",
+                expected_sections=["Section 54"],
+                retrieved_sections=["Preamble"],
+                retrieved_chunk_types=["preamble"],
+                boilerplate_slots=1,
+                matched=[],
+                failure_mode="noise-pollution",
+            ),
+        ]
+        report = format_report("land", rows, top_k=5)
+        self.assertIn("hit=1", report)
+        self.assertIn("noise-pollution=1", report)
+        self.assertIn("`x-01`", report)
+        self.assertIn("`x-02`", report)
+
+
+# ── Memory recall regressions ("Naitwa nani?" bug family) ─────────────────────
+#
+# These tests lock in the three fixes made after the LangSmith trace where
+# an English "my name is Dave" → employment question → Swahili "Naitwa
+# nani?" sequence produced employment termination advice instead of a
+# bilingual refusal / name recall. See also the ``memory-lookup-sw``
+# golden case for the end-to-end assertion.
+
+
+class TestSpecialistOutputsReducer(unittest.TestCase):
+    """The reducer must reset on the supervisor's ``None`` sentinel."""
+
+    def _reducer(self):
+        # Imported lazily so the module import doesn't pull the full
+        # graph builder (which requires boto3 clients) at module load.
+        from app.graph import _specialist_outputs_reducer
+        return _specialist_outputs_reducer
+
+    def test_concatenates_within_a_turn(self):
+        # Parallel fan-out across specialists still works as list append.
+        reducer = self._reducer()
+        first = reducer([], [{"agent": "employment", "text": "e"}])
+        second = reducer(first, [{"agent": "land", "text": "l"}])
+        self.assertEqual(
+            [o["agent"] for o in second],
+            ["employment", "land"],
+        )
+
+    def test_none_incoming_resets_accumulator(self):
+        # The supervisor emits ``None`` at the start of each turn so the
+        # checkpointer doesn't carry stale outputs forward.
+        reducer = self._reducer()
+        populated = [{"agent": "employment", "text": "stale"}]
+        self.assertEqual(reducer(populated, None), [])
+
+    def test_handles_none_existing(self):
+        reducer = self._reducer()
+        self.assertEqual(
+            reducer(None, [{"agent": "chat", "text": "ok"}]),
+            [{"agent": "chat", "text": "ok"}],
+        )
+
+    def test_supervisor_node_emits_reset_sentinel(self):
+        # A quick integration-style check: the supervisor node's return
+        # dict must include ``specialist_outputs: None`` so the reducer
+        # clears stale state even when the supervisor hits the happy path.
+        from agents import supervisor as supervisor_module
+        from unittest.mock import patch
+
+        with patch.object(
+            supervisor_module,
+            "route_supervisor",
+            return_value=(["chat"], "routed"),
+        ):
+            # Build a minimal supervisor node inline to avoid constructing
+            # the full graph (which needs live AWS clients).
+            def supervisor_node(state: dict) -> dict:
+                selected, reason = supervisor_module.route_supervisor(
+                    [], None, "haiku",
+                )
+                return {
+                    "selected_agents": selected,
+                    "routing_reason": reason,
+                    "needs_rag": selected != ["chat"],
+                    "specialist_outputs": None,
+                }
+
+            out = supervisor_node({"messages": []})
+            self.assertIn("specialist_outputs", out)
+            self.assertIsNone(out["specialist_outputs"])
+
+
+class TestSpecialistMarksRefusalBlocked(unittest.TestCase):
+    """When the model emits BILINGUAL_REFUSAL verbatim, blocked must be True."""
+
+    def test_model_emitted_refusal_detection(self):
+        from agents.specialists import _is_model_emitted_refusal
+        self.assertTrue(_is_model_emitted_refusal(BILINGUAL_REFUSAL))
+        # Trailing whitespace / punctuation shouldn't break detection.
+        self.assertTrue(_is_model_emitted_refusal(BILINGUAL_REFUSAL + "  "))
+        self.assertTrue(_is_model_emitted_refusal(BILINGUAL_REFUSAL + "."))
+        self.assertFalse(_is_model_emitted_refusal(""))
+        self.assertFalse(_is_model_emitted_refusal(
+            "The Employment Act 2007 Section 40 provides..."
+        ))
+
+    def test_chat_agent_marks_refusal_blocked(self):
+        # The chat agent feeds through invoke_chat, so its output is
+        # whatever Bedrock returns. If the model refuses, blocked must be
+        # True so the synthesizer's fast-path suppresses sibling outputs.
+        from agents.specialists import build_specialist
+        from unittest.mock import patch
+
+        dummy_rag_adapter = object()
+        specialist = build_specialist(
+            "chat",
+            rag_adapter=dummy_rag_adapter,
+            bedrock_runtime=object(),
+            model_id="haiku",
+            s3_client=object(),
+            s3_bucket="test",
+        )
+        state = {
+            "selected_agents": ["chat"],
+            "language": "swahili",
+            "messages": [{"role": "user", "content": "What's the weather?"}],
+        }
+        with patch(
+            "agents.specialists.invoke_chat",
+            return_value=BILINGUAL_REFUSAL,
+        ):
+            out = specialist(state)
+        outputs = out["specialist_outputs"]
+        self.assertEqual(len(outputs), 1)
+        self.assertTrue(outputs[0]["blocked"])
+        self.assertEqual(outputs[0]["citations"], [])
+
+    def test_chat_agent_does_not_falsely_mark_normal_output(self):
+        from agents.specialists import build_specialist
+        from unittest.mock import patch
+
+        specialist = build_specialist(
+            "chat",
+            rag_adapter=object(),
+            bedrock_runtime=object(),
+            model_id="haiku",
+            s3_client=object(),
+            s3_bucket="test",
+        )
+        state = {
+            "selected_agents": ["chat"],
+            "language": "english",
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+        with patch(
+            "agents.specialists.invoke_chat",
+            return_value="Hello! Ask me anything about Kenyan law.",
+        ):
+            out = specialist(state)
+        self.assertFalse(out["specialist_outputs"][0]["blocked"])
+
+
 # ── Runner ────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -1703,6 +2274,9 @@ if __name__ == "__main__":
         TestRRF,
         TestFilters,
         TestRunRag,
+        TestAuditClassify,
+        TestSpecialistOutputsReducer,
+        TestSpecialistMarksRefusalBlocked,
     ]:
         suite.addTests(loader.loadTestsFromTestCase(cls))
 
