@@ -29,6 +29,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import boto3
+from botocore.config import Config as BotoConfig
 import chromadb
 
 from app.config import load_config
@@ -37,10 +38,28 @@ S3_BUCKET = os.environ.get("S3_BUCKET", "haki-ai-data")
 CHUNKS_PREFIX = "processed-chunks/"
 COLLECTION_NAME = "haki_chunks"
 EMBED_MODEL = "amazon.titan-embed-text-v2:0"
-MAX_WORKERS = 4
+# Titan Embed Text v2's default on-demand quota is ~10 TPS per account.
+# MAX_WORKERS=2 with adaptive retries (see BOTO_CONFIG below) keeps the
+# effective rate well under that; anything higher starts bleeding chunks
+# to ThrottlingException on large re-embeds.
+MAX_WORKERS = 2
+BOTO_CONFIG = BotoConfig(
+    retries={"max_attempts": 10, "mode": "adaptive"},
+    read_timeout=30,
+    connect_timeout=10,
+)
 
-# Persistent store sits next to this file — excluded from git and Lambda zip
-VECTORSTORE_PATH = os.path.join(os.path.dirname(__file__), ".local-vectorstore")
+# Persistent store lives at backend/.local-vectorstore (one level up from
+# backend/app/) so the eval runner and ingest share the same collection.
+# Before this fix, `dirname(__file__)` resolved to backend/app/, which
+# silently split the corpus into two parallel ChromaDB stores — eval
+# reads from backend/.local-vectorstore while ingest wrote to
+# backend/app/.local-vectorstore. See `swahili_retrieval_ulizallama.plan.md`
+# §5b for the symptom trail that uncovered this.
+VECTORSTORE_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    ".local-vectorstore",
+)
 
 
 # ── S3 helpers ────────────────────────────────────────────────────────────────
@@ -99,8 +118,13 @@ def main():
         aws_secret_access_key="test",
     )
 
-    # Real AWS Bedrock Runtime for Titan embeddings
-    bedrock = boto3.client("bedrock-runtime", region_name=config.aws_region)
+    # Real AWS Bedrock Runtime for Titan embeddings (adaptive retry keeps
+    # us polite when the account's TPS quota gets hot).
+    bedrock = boto3.client(
+        "bedrock-runtime",
+        region_name=config.aws_region,
+        config=BOTO_CONFIG,
+    )
 
     # ChromaDB persistent collection (cosine similarity matches S3 Vectors default)
     chroma = chromadb.PersistentClient(path=VECTORSTORE_PATH)
