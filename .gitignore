@@ -39,7 +39,11 @@ backend/.venv/
 **/__pycache__/
 *.pyc
 *.py.bak
-backend/.local-vectorstore/
+# Local ChromaDB store lives next to the ingest + eval entry points.
+# Ingest used to create it under backend/app/ by mistake (since fixed),
+# so we pattern-match any `.local-vectorstore/` anywhere under backend/
+# to cover historical and future locations.
+backend/**/.local-vectorstore/
 
 # macOS
 .DS_Store
