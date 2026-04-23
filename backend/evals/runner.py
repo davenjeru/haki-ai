@@ -50,6 +50,7 @@ class EvalResult:
     answer: str
     citations: list[dict]
     retrieved_contexts: list[str]
+    retrieved_metadata: list[dict] = field(default_factory=list)
     blocked: bool = False
     error: str | None = None
     extra: dict[str, Any] = field(default_factory=dict)
@@ -86,17 +87,25 @@ def _build_adapter(config: Config):
     ), s3
 
 
-def _extract_retrieved_contexts(result: dict) -> list[str]:
-    """Pulls the chunk texts out of the retrieval-augmented generation result."""
-    contexts: list[str] = []
-    for ref in result.get("citations") or []:
-        text = (
-            (ref.get("content") or {}).get("text")
-            if isinstance(ref.get("content"), dict)
-            else ref.get("text")
-        )
-        if isinstance(text, str) and text.strip():
-            contexts.append(text.strip())
+def _extract_retrieved_contexts(result: dict) -> list[tuple[str, dict]]:
+    """
+    Returns the ordered list of post-rerank retrieved chunks as
+    ``(text, metadata)`` tuples.
+
+    Both the advanced-RAG pipeline (``run_rag``) and the legacy Bedrock KB
+    ``retrieve_and_generate`` response store retrieved chunks under
+    ``citations[*].retrievedReferences[*]``. We walk that structure so
+    downstream scorers (RAGAS, retrieval-recall, MRR) see exactly what
+    came out of rerank, not the post-dedup citation list.
+    """
+    contexts: list[tuple[str, dict]] = []
+    for citation_group in result.get("citations") or []:
+        for ref in citation_group.get("retrievedReferences") or []:
+            content = ref.get("content") or {}
+            text = content.get("text") if isinstance(content, dict) else None
+            meta = ref.get("metadata") or {}
+            if isinstance(text, str) and text.strip():
+                contexts.append((text.strip(), meta))
     return contexts
 
 
@@ -140,11 +149,13 @@ def run_case(case: GoldenCase, *, rag_adapter, s3_client, bucket: str, model_id:
         )
 
     citations = extract_citations(result, s3_client=s3_client, bucket=bucket)
+    retrieved = _extract_retrieved_contexts(result)
     return EvalResult(
         case=case,
         answer=result.get("output", {}).get("text", ""),
         citations=citations,
-        retrieved_contexts=_extract_retrieved_contexts(result),
+        retrieved_contexts=[text for text, _ in retrieved],
+        retrieved_metadata=[meta for _, meta in retrieved],
     )
 
 

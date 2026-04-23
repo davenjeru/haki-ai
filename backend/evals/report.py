@@ -26,6 +26,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .llm_judge import AXES, JudgeScore
+from .retrieval_metrics import RetrievalReport
 from .runner import EvalResult
 
 
@@ -67,6 +68,7 @@ def write_report(
     case_scores: list[CaseScore],
     *,
     ragas: dict[str, Any] | None = None,
+    retrieval: RetrievalReport | None = None,
     out_dir: str | None = None,
 ) -> str:
     """Writes the markdown report and returns the full output path."""
@@ -103,6 +105,24 @@ def write_report(
             if name in ragas:
                 lines.append(f"| {name} | {_fmt_num(ragas[name], 3)} |")
         lines.append("")
+
+    if retrieval is not None:
+        lines.append("## Retrieval metrics")
+        lines.append("")
+        lines.append(f"Scorable cases: {retrieval.case_count}  •  "
+                     f"**Recall@{retrieval.recall_k}: {_fmt_num(retrieval.recall_at_k, 3)}**  •  "
+                     f"**MRR@{retrieval.mrr_k}: {_fmt_num(retrieval.mrr_at_k, 3)}**")
+        lines.append("")
+        if retrieval.by_language:
+            lines.append("| Language | n | Recall@k | MRR@k |")
+            lines.append("| --- | --- | --- | --- |")
+            for lang, stats in retrieval.by_language.items():
+                lines.append(
+                    f"| {lang} | {int(stats['count'])} "
+                    f"| {_fmt_num(float(stats['recall_at_k']), 3)} "
+                    f"| {_fmt_num(float(stats['mrr_at_k']), 3)} |"
+                )
+            lines.append("")
 
     lines.append("## Per-category breakdown")
     lines.append("")

@@ -24,6 +24,7 @@ from .llm_judge import judge
 from .loader import load_golden_set
 from .ragas_run import score_with_ragas
 from .report import CaseScore, _aggregate_judge, _overall_mean, emit_cloudwatch_score, write_report
+from .retrieval_metrics import format_retrieval_report, summarize_retrieval
 from .runner import run_all
 
 
@@ -33,9 +34,8 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--limit", type=int, default=None, help="Run only the first N cases.")
     p.add_argument(
         "--category",
-        choices=["constitution", "employment", "land"],
         default=None,
-        help="Restrict the run to one category.",
+        help="Restrict the run to one category (e.g. constitution, employment, land, criminal).",
     )
     p.add_argument(
         "--skip-cloudwatch",
@@ -82,7 +82,9 @@ def main(argv: list[str] | None = None) -> int:
     aggregate = _aggregate_judge([cs.judge for cs in case_scores])
     mean_score = _overall_mean(aggregate)
 
-    out_path = write_report(case_scores, ragas=ragas_scores)
+    retrieval = summarize_retrieval(results)
+
+    out_path = write_report(case_scores, ragas=ragas_scores, retrieval=retrieval)
     print(f"[evals] report written → {out_path}")
     print(f"[evals] overall LLM-judge mean (0–5): {mean_score:.2f}")
     for axis, value in aggregate.items():
@@ -91,6 +93,7 @@ def main(argv: list[str] | None = None) -> int:
         print("[evals] RAGAS:")
         for metric, value in ragas_scores.items():
             print(f"        {metric:>25}: {value:.3f}")
+    print(f"[evals] {format_retrieval_report(retrieval)}")
 
     if not args.skip_cloudwatch:
         cloudwatch = make_cloudwatch(config)
