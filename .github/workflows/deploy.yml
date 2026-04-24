@@ -140,6 +140,10 @@ jobs:
 
       - name: Build SPA
         working-directory: frontend
+        env:
+          # Inlined into the bundle so ClerkProvider receives a valid
+          # publishable key. Browser-safe value (pk_test_* / pk_live_*).
+          VITE_CLERK_PUBLISHABLE_KEY: ${{ vars.VITE_CLERK_PUBLISHABLE_KEY }}
         run: |
           npm ci --prefer-offline --no-audit
           npm run build

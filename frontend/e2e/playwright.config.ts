@@ -21,7 +21,11 @@ export default defineConfig({
   reporter: process.env.CI ? [['html', { outputFolder: 'playwright-report' }], ['github']] : [['list']],
   outputDir: path.join(__dirname, 'test-results'),
   timeout: 30_000,
-  expect: { timeout: 5_000 },
+  // 10s for individual expect() polls so assertions that depend on
+  // Clerk's async load state (e.g. <SignedIn>/<SignedOut>-gated elements)
+  // don't intermittently fail on slower runs. Still keeps a failing test
+  // from hanging the suite.
+  expect: { timeout: 10_000 },
   use: {
     baseURL: 'http://localhost:5173',
     trace: 'retain-on-failure',

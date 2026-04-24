@@ -10,13 +10,18 @@ import tailwindcss from '@tailwindcss/vite'
 // When LOCAL_API_URL is set, the dev server proxies /chat → LocalStack.
 // In production there is no proxy — the browser calls VITE_API_BASE_URL directly.
 //
-// Env is loaded from two places and merged:
-//   1. `../.env`        — repo-root secrets shared with the backend
-//                         (e.g. VITE_CLERK_PUBLISHABLE_KEY lives here so the
-//                         Python server and the Vite bundle read it from one
-//                         canonical file).
-//   2. `./.env.local`   — frontend-only local overrides (LOCAL_API_URL,
-//                         VITE_API_BASE_URL). Wins on conflict.
+// Env resolution order (later wins):
+//   1. `../.env`              — repo-root secrets shared with the backend
+//                               (e.g. VITE_CLERK_PUBLISHABLE_KEY lives here
+//                               in dev so the Python server and the Vite
+//                               bundle read it from one canonical file).
+//   2. `./.env[.local|.<mode>|.<mode>.local]` — frontend-only local
+//                               overrides (LOCAL_API_URL,
+//                               VITE_API_BASE_URL).
+//   3. `process.env.VITE_*`   — CI/CD-supplied values (GitHub Actions sets
+//                               the publishable key this way at `npm run
+//                               build` time so it's inlined into the
+//                               production bundle).
 // Non-VITE_* values remain server-side only per Vite's security model; VITE_*
 // values are injected into the client bundle via `define`.
 
@@ -27,17 +32,24 @@ export default defineConfig(({ mode }) => {
 
   const localApiUrl = env.LOCAL_API_URL
 
-  // Inject VITE_* keys from root into the browser bundle. Vite's default
-  // bundle-injection only reads from `envDir`, so anything unique to the
-  // root `.env` needs an explicit `define` entry to reach client code.
-  const viteKeysFromRoot = Object.entries(rootEnv).filter(([k]) => k.startsWith('VITE_'))
-  const defineRootVites = Object.fromEntries(
-    viteKeysFromRoot.map(([k, v]) => [`import.meta.env.${k}`, JSON.stringify(v)]),
+  // Collect VITE_* keys from every source and inject them via `define` so
+  // the bundle picks them up no matter where they originate. `process.env`
+  // wins over `../.env`, matching the conventional precedence (explicit
+  // runtime override beats committed defaults).
+  const viteKeys = new Set<string>([
+    ...Object.keys(rootEnv).filter((k) => k.startsWith('VITE_')),
+    ...Object.keys(process.env).filter((k) => k.startsWith('VITE_')),
+  ])
+  const viteDefines = Object.fromEntries(
+    [...viteKeys].map((k) => {
+      const value = process.env[k] ?? rootEnv[k] ?? ''
+      return [`import.meta.env.${k}`, JSON.stringify(value)]
+    }),
   )
 
   return {
     plugins: [react(), tailwindcss()],
-    define: defineRootVites,
+    define: viteDefines,
     server: {
       proxy: localApiUrl
         ? {
