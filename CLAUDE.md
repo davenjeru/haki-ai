@@ -9,8 +9,13 @@ advanced RAG pipeline (hybrid retrieval + rerank) over Bedrock Claude.
 ## Stack
 - Frontend: React + Vite + Tailwind v4, full EN/SW i18n with auto
   language switch driven by the backend's Comprehend detection.
+- Auth: **optional** Clerk sign-in via `@clerk/clerk-react`. Anonymous
+  usage is the default; signing in unlocks per-user chat history, LLM-
+  generated chat titles, and inline rename.
 - Backend: Python 3.12 Lambda orchestrating a LangGraph StateGraph
-  with DynamoDB checkpointing for multi-turn memory.
+  with DynamoDB checkpointing for multi-turn memory. Clerk JWT
+  verification (PyJWT + JWKS, issuer auto-derived from the publishable
+  key) gates the signed-in routes.
 - RAG: pre-chunking pipeline (TypeScript + LiteParse OCR + Haiku
   extraction) → Bedrock KB over S3 Vectors → advanced-RAG pipeline
   (query expansion, hybrid BM25+dense, RRF, TOC filter, Cohere rerank).
@@ -23,7 +28,8 @@ advanced RAG pipeline (hybrid retrieval + rerank) over Bedrock Claude.
   the Law of Contract Act + Consumer Protection Act 2012.
 - Evaluation: RAGAS (faithfulness / answer_relevancy /
   context_precision / context_recall) + LLM-as-judge on 4 axes.
-- IaC: Terraform modular. GitHub Actions for CI, deploy, nightly evals.
+- IaC: Terraform modular. GitHub Actions for CI (unit + Playwright e2e),
+  deploy, nightly evals.
 - Observability: LangSmith per-turn tracing + CloudWatch metrics,
   alarms, dashboards, and SNS alerts.
 
@@ -32,38 +38,48 @@ advanced RAG pipeline (hybrid retrieval + rerank) over Bedrock Claude.
 ```mermaid
 flowchart TB
   subgraph Client
-    fe[React + Vite frontend<br/>EN/SW i18n + LanguageToggle]
+    fe["React + Vite frontend<br/>EN/SW i18n + ClerkProvider<br/>ThreadSidebar"]
+  end
+
+  subgraph Auth["Clerk (external)"]
+    ck["JWKS + session JWTs"]
   end
 
   subgraph AWS
-    apigw[API Gateway HTTP]
-    lam[Lambda: app.handler]
-    ddb[(DynamoDB<br/>LangGraph checkpoints)]
-    kb[(Bedrock KB<br/>S3 Vectors index)]
-    br[Bedrock Claude + Titan + Rerank]
-    cmp[Comprehend]
-    s3[(S3 haki-ai-data<br/>raw-laws, processed-chunks)]
-    cw[(CloudWatch<br/>metrics + alarms)]
-    sns[SNS email alerts]
+    apigw["API Gateway HTTP<br/>POST /chat · GET /chat/history<br/>GET/PATCH /chat/threads · POST /chat/threads/claim"]
+    lam["Lambda: app.handler"]
+    ckpt[("DynamoDB<br/>haki-ai-checkpoints<br/>LangGraph memory")]
+    th[("DynamoDB<br/>haki-ai-chat-threads<br/>user_id → threads, GSI on thread_id")]
+    kb[("Bedrock KB<br/>S3 Vectors index")]
+    br["Bedrock<br/>Claude + Titan + Rerank"]
+    cmp["Comprehend"]
+    s3[("S3 haki-ai-data<br/>raw-laws, processed-chunks, page-images")]
+    cw[("CloudWatch<br/>metrics + alarms")]
+    sns["SNS email alerts"]
   end
 
-  fe -->|/chat| apigw --> lam
-  lam --> ddb
+  fe <-.->|"getToken / SignedIn"| ck
+  fe -->|/chat + optional Bearer| apigw
+  fe -->|/chat/threads* + Bearer| apigw
+  apigw --> lam
+  lam -->|verify JWT via JWKS| ck
+  lam --> ckpt
+  lam --> th
   lam --> cmp
   lam --> kb --> s3
   lam --> br
   lam --> cw --> sns
 
   subgraph Pipeline
-    raw[(data/raw PDFs)] --> pipe[pipeline: OCR + Haiku extract + chunk]
+    raw[(data/raw PDFs)] --> pipe["pipeline: OCR + Haiku extract + chunk"]
     pipe --> s3
-    s3 --> ing[ingestion_trigger Lambda]
+    s3 --> ing["ingestion_trigger Lambda"]
     ing --> kb
   end
 
   subgraph Dev
-    ls[(LangSmith traces)]
-    lam -.optional.-> ls
+    lsm[(LangSmith traces)]
+    lam -.optional.-> lsm
   end
 ```
 
@@ -95,28 +111,35 @@ flowchart LR
 ## Project layout
 ```
 haki-ai/
-├── frontend/              # React + Vite + Tailwind, i18n
+├── frontend/
+│   ├── src/
+│   │   ├── api/               # chatClient.ts + threadsClient.ts
+│   │   ├── components/        # ChatApp, ThreadSidebar, Composer, MessageThread, SourcePanel, …
+│   │   ├── lib/               # I18nContext, AuthBridge, authedFetch
+│   │   └── main.tsx           # ClerkProvider root
+│   └── e2e/                   # Playwright POM + fixtures + specs + config
 ├── backend/
-│   ├── app/               # handler.py, graph.py, config.py, server_local.py, ingest_local.py
-│   ├── agents/            # supervisor, specialists, chat, synthesizer, classifier
-│   ├── rag/               # query_expansion, hybrid_retriever, bm25, rrf, filters, reranker, citations, generator
-│   ├── clients/           # boto3 factory + ComprehendAdapter / BedrockRAGAdapter / LocalRAGAdapter
-│   ├── memory/            # DynamoDBSaver checkpointer
-│   ├── observability/     # LangSmith tracing + CloudWatch metrics
-│   ├── prompts/           # all LLM prompts
-│   ├── evals/             # golden_set.jsonl + RAGAS + llm_judge + report writer
-│   └── tests/             # unit + e2e
-├── pipeline/              # TypeScript: PDF → pages → chunks
-├── data/raw/              # committed Kenyan law PDFs
+│   ├── app/                   # handler.py, graph.py, auth.py, config.py, server_local.py
+│   ├── agents/                # supervisor, specialists, chat, synthesizer, classifier, title
+│   ├── rag/                   # query_expansion, hybrid_retriever, bm25, rrf, filters, reranker, citations, generator
+│   ├── clients/               # boto3 factory + ComprehendAdapter / BedrockRAGAdapter / LocalRAGAdapter
+│   ├── memory/                # checkpointer.py (LangGraph) + threads.py (per-user index)
+│   ├── observability/         # LangSmith tracing + CloudWatch metrics
+│   ├── prompts/               # all LLM prompts incl. TITLE_GENERATOR_PROMPT
+│   ├── evals/                 # golden_set.jsonl + RAGAS + llm_judge + report writer
+│   └── tests/                 # unit + e2e
+├── pipeline/                  # TypeScript: PDF → pages → chunks
+├── data/raw/                  # committed Kenyan law PDFs
 ├── infra/
 │   └── modules/
-│       ├── storage/       # S3 + S3 Vectors index (source filterable)
-│       ├── compute/       # Lambda + DynamoDB + ingestion_trigger
-│       ├── api/           # API Gateway HTTP
-│       ├── ai/            # Bedrock KB + Guardrails
-│       └── observability/ # alarms + dashboard + SNS
-├── .github/workflows/     # ci.yml, deploy.yml, eval-nightly.yml
-└── scripts/               # bootstrap.sh
+│       ├── storage/           # S3 + S3 Vectors index + checkpoints + chat_threads (with GSI)
+│       ├── compute/           # Lambda + ingestion_trigger + CLERK_PUBLISHABLE_KEY env
+│       ├── api/               # API Gateway HTTP (5 routes, PATCH in CORS)
+│       ├── ai/                # Bedrock KB + Guardrails
+│       ├── web/               # CloudFront + S3 static site
+│       └── observability/     # alarms + dashboard + SNS
+├── .github/workflows/         # ci.yml (backend + frontend + e2e), deploy.yml, eval-nightly.yml
+└── scripts/                   # bootstrap.sh
 ```
 
 ## Per-package docs
@@ -186,6 +209,50 @@ eval-score regressions >5%.
 scripts, `*_local.py` excluded). Each package has its own
 `CLAUDE.md` with a mermaid diagram.
 
+### Optional auth + per-user chat history (Phase 7)
+
+Anonymous usage is preserved as the default. Clerk sign-in is bolted
+onto the existing stack along three independent axes: frontend
+provider, backend verification, and dedicated storage.
+
+- **No extra env var for issuer derivation.** The Clerk publishable
+  key already encodes the Frontend API host; `backend/app/auth.py`
+  base64-decodes it and constructs the JWKS URL at runtime. One
+  canonical `VITE_CLERK_PUBLISHABLE_KEY` in the root `.env` feeds both
+  `ClerkProvider` (via Vite's `define`) and the backend's JWT verifier.
+- **Thread index is its own table**, not a new item type on the
+  checkpoints table. `backend/memory/threads.py` stores
+  `(user_id, thread_id, title, timestamps)` rows in `haki-ai-chat-threads`
+  with a `KEYS_ONLY` GSI on `thread_id` so the ownership gate
+  (`_thread_owner()`) is one RCU. Keeping it separate from
+  `DynamoDBSaver` leaves the checkpoint schema untouched.
+- **Ownership gate, not token gate, on `POST /chat` + `GET /chat/history`.**
+  Both routes accept Bearer *optionally* — but if the `sessionId`
+  they're called with is already owned by a different user in the
+  GSI, the handler short-circuits with a `403`. The graph is never
+  invoked and `load_history` is never called, so cross-user memory
+  cannot leak even via guessed UUIDs.
+- **Self-healing client**: `frontend/src/api/chatClient.ts` treats a
+  `403` on `POST /chat` or `GET /chat/history` as "my persisted
+  `sessionId` is stale" (the usual cause is signing out of an account
+  that claimed the thread). It resets the local session id and retries
+  once — so sign-out + hard refresh never leaves the UI broken.
+- **Titles are advisory.** `backend/agents/title.py` runs a single
+  cheap Haiku call on the first signed-in turn and writes a ≤6-word
+  title. Any failure returns `"New chat"` and is logged — the title
+  path can never fail the chat reply.
+
+Data-flow contracts for the new routes:
+
+```
+POST /chat/threads/claim  { threadId }              → 200 { thread }
+GET  /chat/threads                                   → 200 { threads: [...] }
+PATCH /chat/threads       { threadId, title }        → 200 { thread } | 404 | 403
+```
+
+All three require a verified Clerk session JWT; a missing / invalid /
+expired Bearer returns `401 { error: "Authentication required" }`.
+
 ## Chunk metadata sidecar (Bedrock KB native)
 ```json
 {
@@ -216,8 +283,12 @@ scripts, `*_local.py` excluded). Each package has its own
   Bedrock calls fail inside the Lambda container by design.
 
 ### Commands
-- `make test` — `unittest discover -s tests -p 'test_unit.py'` (backend)
-  + `tsc --noEmit` (frontend) + `npm test` (pipeline).
+- `make test` — `unittest discover -s tests -p 'test_unit.py'` (backend,
+  264 tests in ~8 s) + `tsc --noEmit` (frontend) + `npm test` (pipeline).
+- `npm run test:e2e` (from `frontend/`) — Playwright suite:
+  5 anonymous specs always run; 5 signed-in specs skip unless
+  `CLERK_SECRET_KEY` + `E2E_CLERK_USER_USERNAME` +
+  `E2E_CLERK_USER_PASSWORD` are set.
 - `make eval` — `uv run -m evals.run` against the golden set.
 - `make ingest-local` — hydrate `.local-vectorstore/` from LocalStack S3.
 
@@ -232,12 +303,17 @@ scripts, `*_local.py` excluded). Each package has its own
 - Remote backend: S3 bucket `haki-ai-terraform-state`.
 - Workspaces: `default` → prod, `local` → LocalStack. Flip with
   `terraform workspace select`.
-- Prod apply needs `TF_VAR_langsmith_api_key` in the environment
-  (CI reads it from GitHub Secrets).
+- Prod apply needs `TF_VAR_langsmith_api_key` (secret) and
+  `TF_VAR_clerk_publishable_key` (GitHub Actions **variable**
+  `VITE_CLERK_PUBLISHABLE_KEY` — it's browser-safe and reused by the
+  Vite build step in the same workflow).
 
 ## Current status
-Phase 1–6 of the rubric-alignment plan are complete: advanced RAG,
+Phase 1–7 of the rubric-alignment plan are complete: advanced RAG,
 two-tier multi-agent, eval harness, Swahili UI, clone-and-run
 Makefile, auto ingestion, three GitHub Actions workflows, backend
-refactor, and per-package diagram-led docs. Remaining work is prod
-rollout and any final demo polish.
+refactor, per-package diagram-led docs, and optional Clerk auth with
+per-user thread history + ownership-gated signed-in routes. Remaining
+work (custom Clerk domain for `pk_live_*`, API Gateway throttling,
+mobile drawer, thread delete) is tracked in the README's
+_Production readiness_ section.
