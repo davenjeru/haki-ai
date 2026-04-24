@@ -74,6 +74,9 @@ export function ChatApp() {
           setActiveSource(null)
         }
       } finally {
+        // Pick up any self-healed id (chatClient resets on 403) so the
+        // sidebar's active-thread styling stays in sync with reality.
+        setActiveThreadId(getSessionId())
         setHydrating(false)
       }
     },
@@ -168,6 +171,8 @@ export function ChatApp() {
       if (isSignedIn) {
         setThreadsRefreshKey((k) => k + 1)
       }
+      // Pick up any self-healed id (chatClient resets on 403 and retries).
+      setActiveThreadId(getSessionId())
     } catch (e) {
       const err = e instanceof Error ? e.message : t('errors.generic')
       setMessages((m) => [

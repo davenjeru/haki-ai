@@ -196,11 +196,21 @@ export async function sendChatMessage(message: string): Promise<ChatResponse> {
   const path = import.meta.env.VITE_CHAT_PATH ?? '/chat'
   const url = `${base}${path.startsWith('/') ? path : `/${path}`}`
 
-  const res = await authedFetch(url, {
+  const buildInit = () => ({
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ message: trimmed, sessionId: currentSessionId }),
   })
+
+  let res = await authedFetch(url, buildInit())
+  if (res.status === 403) {
+    // Stale session ownership: the persisted sessionId points at a thread
+    // owned by a signed-in user (likely us from an earlier session before
+    // signing out). Mint a fresh anonymous thread_id and retry once so
+    // the UX self-heals without an error toast.
+    resetChatSession()
+    res = await authedFetch(url, buildInit())
+  }
 
   const text = await res.text()
   let data: unknown
@@ -254,6 +264,14 @@ export async function fetchChatHistory(sessionId: string): Promise<ChatMessage[]
   if (base === undefined) return []
   const url = `${base}/chat/history?sessionId=${encodeURIComponent(sessionId)}`
   const res = await authedFetch(url, { method: 'GET' })
+  if (res.status === 403) {
+    // See `sendChatMessage` — the on-device sessionId is no longer valid
+    // for the current auth state (typically: we signed out of an account
+    // that had claimed the thread). Reset locally so subsequent calls go
+    // out with a fresh id, and return empty so the UI renders cleanly.
+    resetChatSession()
+    return []
+  }
   if (!res.ok) {
     // Brand-new sessions return 200 with an empty list; a non-2xx here means
     // something else went wrong. Swallow the error so an offline backend
