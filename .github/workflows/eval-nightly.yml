@@ -11,8 +11,13 @@ on:
   workflow_dispatch:
 
 permissions:
+  # `id-token: write` — assume the OIDC role for AWS credentials.
+  # `contents: write` — the post-eval step posts the markdown report as
+  # a commit comment on main via `createCommitComment`, which is part
+  # of the Contents API and needs write (the default `read` fails with
+  # "Resource not accessible by integration").
   id-token: write
-  contents: read
+  contents: write
 
 jobs:
   eval:
@@ -43,6 +48,25 @@ jobs:
           S3_BUCKET: ${{ vars.S3_BUCKET }}
         run: uv run python -m evals.run --ragas
 
+      - name: Render report to job summary
+        # Surfaces the report inline on the workflow run page (no download,
+        # no click-through). GITHUB_STEP_SUMMARY is rendered as markdown
+        # and supports up to 1 MiB — well over the ~150 KB report we
+        # currently produce. This is the primary way to read the report;
+        # the commit-comment step below is a secondary signal so
+        # regressions are visible from the commit timeline on main.
+        if: always()
+        working-directory: backend
+        run: |
+          shopt -s nullglob
+          latest=$(ls -t evals/reports/*.md 2>/dev/null | head -1)
+          if [ -z "$latest" ]; then
+            echo "No report produced." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          echo "Rendering $latest ($(wc -c < "$latest") bytes) to job summary."
+          cat "$latest" >> "$GITHUB_STEP_SUMMARY"
+
       - name: Upload report
         uses: actions/upload-artifact@v4
         with:
@@ -51,6 +75,13 @@ jobs:
           if-no-files-found: warn
 
       - name: Comment on latest main commit
+        # Posts a short headline + link-back to the workflow run on the
+        # latest main commit. The full report exceeds GitHub's 65,536-char
+        # comment-body limit (it's ~150 KB of per-question detail), so we
+        # post only the headline summary here and direct readers to the
+        # Job Summary on the run page for the full breakdown. Requires
+        # `contents: write` — the default read-only token fails with
+        # "Resource not accessible by integration".
         if: github.ref == 'refs/heads/main'
         uses: actions/github-script@v7
         with:
@@ -70,7 +101,25 @@ jobs:
               core.info('No report generated; skipping comment.');
               return;
             }
-            const body = fs.readFileSync(path.join(reportsDir, latest), 'utf8');
+            const full = fs.readFileSync(path.join(reportsDir, latest), 'utf8');
+            // Headline = everything above the per-question detail section.
+            // The report writer emits `## Per-question detail` as the
+            // marker; fall back to first 200 lines if that marker changes.
+            const marker = '## Per-question detail';
+            const idx = full.indexOf(marker);
+            const headline = idx > 0
+              ? full.slice(0, idx).trimEnd()
+              : full.split('\n').slice(0, 200).join('\n');
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const body = [
+              `## Nightly eval — ${latest}`,
+              '',
+              headline,
+              '',
+              `---`,
+              '',
+              `Full per-question detail is in the [workflow run summary](${runUrl}) (rendered inline — no download).`,
+            ].join('\n');
             const { data: commits } = await github.rest.repos.listCommits({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -81,5 +130,5 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               commit_sha: commits[0].sha,
-              body: `## Nightly eval — ${latest}\n\n${body}`,
+              body,
             });
