@@ -24,15 +24,13 @@ const en = {
   'chat.placeholder.sw': 'Uliza kuhusu sheria za Kenya kwa Kiswahili…',
   'chat.placeholder.mixed': 'Ask in English or Swahili — Uliza kwa Kiingereza au Kiswahili…',
   'chat.disclaimer': 'Not legal advice. Verify citations against official sources.',
+  'chat.clear': 'Clear chat',
+  'chat.clear.tooltip': 'Start a new conversation',
 
   'composer.label': 'Your question',
   'composer.send': 'Send',
 
   'lang.toggle.tooltip': 'Switch interface language',
-  'lang.en.label': 'English',
-  'lang.sw.label': 'Kiswahili',
-  'lang.mixed.label': 'Mixed',
-  'lang.badge.tooltip': 'Detected response language',
 
   'source.title': 'Source page',
   'source.counter': '{current} of {total}',
@@ -58,15 +56,13 @@ const sw: Record<I18nKey, string> = {
   'chat.placeholder.sw': 'Uliza kuhusu sheria za Kenya kwa Kiswahili…',
   'chat.placeholder.mixed': 'Ask in English or Swahili — Uliza kwa Kiingereza au Kiswahili…',
   'chat.disclaimer': 'Si ushauri wa kisheria. Hakikisha manukuu dhidi ya vyanzo rasmi.',
+  'chat.clear': 'Futa mazungumzo',
+  'chat.clear.tooltip': 'Anza mazungumzo mapya',
 
   'composer.label': 'Swali lako',
   'composer.send': 'Tuma',
 
   'lang.toggle.tooltip': 'Badilisha lugha ya kiolesura',
-  'lang.en.label': 'Kiingereza',
-  'lang.sw.label': 'Kiswahili',
-  'lang.mixed.label': 'Mchanganyiko',
-  'lang.badge.tooltip': 'Lugha iliyogunduliwa ya jibu',
 
   'source.title': 'Ukurasa wa chanzo',
   'source.counter': '{current} kati ya {total}',

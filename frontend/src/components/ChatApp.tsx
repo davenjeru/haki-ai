@@ -1,5 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { fetchChatHistory, getSessionId, sendChatMessage } from '../api/chatClient'
+import {
+  fetchChatHistory,
+  getSessionId,
+  resetChatSession,
+  sendChatMessage,
+} from '../api/chatClient'
 import { useI18n } from '../lib/I18nContext'
 import { placeholderForLanguage } from '../lib/placeholders'
 import type { ChatMessage, Citation, DetectedLanguage } from '../types/chat'
@@ -127,6 +132,18 @@ export function ChatApp() {
     setActiveSource((prev) => (prev ? { ...prev, index } : prev))
   }, [])
 
+  // "Clear chat" mints a fresh sessionId (= new LangGraph thread_id) so the
+  // next turn starts with no server-side memory, and wipes all local state
+  // that was tied to the old conversation.
+  const handleClearChat = useCallback(() => {
+    if (loading) return
+    resetChatSession()
+    setMessages([])
+    setDraft('')
+    setActiveSource(null)
+    setHintLang(undefined)
+  }, [loading])
+
   return (
     <div className="h-dvh flex flex-col max-w-[1400px] mx-auto px-4 py-5">
       <header className="mb-4 pb-4 border-b border-border flex-shrink-0">
@@ -139,7 +156,34 @@ export function ChatApp() {
               {t('header.subtitle')}
             </p>
           </div>
-          <LanguageToggle />
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={handleClearChat}
+              disabled={loading || messages.length === 0}
+              title={t('chat.clear.tooltip')}
+              aria-label={t('chat.clear.tooltip')}
+              className="inline-flex items-center gap-[0.4rem] text-[0.72rem] font-semibold tracking-[0.08em] uppercase px-3 py-[0.4rem] rounded-full border border-border bg-elevated text-muted hover:text-strong hover:border-accent-bright transition-colors disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:text-muted disabled:hover:border-border cursor-pointer"
+            >
+              <svg
+                width="12"
+                height="12"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2.2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                aria-hidden="true"
+              >
+                <path d="M3 6h18" />
+                <path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+                <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" />
+              </svg>
+              {t('chat.clear')}
+            </button>
+            <LanguageToggle />
+          </div>
         </div>
         <p className="mt-3 text-[0.8rem] text-muted tracking-[0.02em]">
           {t('header.corpus')}

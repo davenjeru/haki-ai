@@ -1,7 +1,6 @@
 import type { ChatMessage } from '../types/chat'
 import { renderAssistantText } from '../lib/renderAssistantText'
 import { CitationBlock } from './CitationBlock'
-import { LanguageBadge } from './LanguageBadge'
 
 interface Props {
   messages: ChatMessage[]
@@ -37,11 +36,6 @@ export function MessageThread({
     <div className="flex flex-col gap-4" role="log" aria-live="polite" aria-relevant="additions">
       {messages.map((m) => (
         <article key={m.id} className={bubbleClasses(m.role, m.blocked, !!m.error)}>
-          {m.role === 'assistant' && m.language && !m.error && (
-            <div className="mb-[0.35rem]">
-              <LanguageBadge language={m.language} />
-            </div>
-          )}
           <div className="text-[0.98rem]">
             {m.error ? (
               <p className="m-0 text-error-text text-[0.95rem]">{m.error}</p>
