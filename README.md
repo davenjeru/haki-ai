@@ -9,7 +9,13 @@ Section citations, works in English or Kiswahili, surfaces the exact
 page of the source PDF alongside every answer, and — optionally —
 keeps per-user chat history when the user signs in with Clerk.
 
-Live at [d35h3o273l67fs.cloudfront.net](https://d35h3o273l67fs.cloudfront.net/).
+**Live app:** <https://d35h3o273l67fs.cloudfront.net/>
+
+<p align="center">
+  <a href="https://d35h3o273l67fs.cloudfront.net/">
+    <img src="docs/Haki-AI%20Demo.png" alt="Haki AI — screenshot of the bilingual chat UI with citations and source page preview" width="720" />
+  </a>
+</p>
 
 ## Table of contents
 
