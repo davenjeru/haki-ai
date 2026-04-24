@@ -149,6 +149,7 @@ resource "terraform_data" "lambda_layer_build" {
   }
 
   provisioner "local-exec" {
+    interpreter = ["bash", "-c"]
     command = <<-EOT
       set -euo pipefail
       BUILD_DIR="${abspath(path.module)}/.layer-build/python"
