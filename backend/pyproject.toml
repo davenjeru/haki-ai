@@ -34,4 +34,9 @@ evals = [
     "datasets>=2.19.0",
     "langchain-aws>=0.2.0",
     "langchain-core>=0.3.0",
+    # Required by ragas.testset default transforms (NER overlap similarity
+    # via OverlapScoreBuilder). RAGAS imports it lazily and raises if
+    # missing; pinning here avoids surprising failures 70 s into a paid
+    # generation run.
+    "rapidfuzz>=3.9.0",
 ]

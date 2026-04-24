@@ -28,6 +28,7 @@ from clients import (
     make_bedrock_agent_runtime,
     make_bedrock_runtime,
     make_s3,
+    make_s3_listing,
 )
 from app.config import Config, load_config
 from prompts import build_system_prompt
@@ -60,6 +61,7 @@ def _build_adapter(config: Config):
     bedrock_runtime = make_bedrock_runtime(config)
     bedrock_agent_runtime = make_bedrock_agent_runtime(config)
     s3 = make_s3(config)
+    s3_list = make_s3_listing(config)
     if config.is_local:
         import os
         vectorstore_path = os.path.join(
@@ -72,6 +74,7 @@ def _build_adapter(config: Config):
             embed_model=config.embedding_model_id,
             vectorstore_path=vectorstore_path,
             s3_client=s3,
+            s3_list_client=s3_list,
             s3_bucket=config.s3_bucket,
             aws_region=config.aws_region,
             chroma_host=config.chroma_host,
@@ -84,6 +87,7 @@ def _build_adapter(config: Config):
         bedrock_runtime=bedrock_runtime,
         config=config,
         s3_client=s3,
+        s3_list_client=s3_list,
     ), s3
 
 

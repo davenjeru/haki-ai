@@ -120,6 +120,16 @@ def main():
 
     # Real AWS Bedrock Runtime for Titan embeddings (adaptive retry keeps
     # us polite when the account's TPS quota gets hot).
+    #
+    # Defensive: if the caller has `AWS_ENDPOINT_URL` exported in their
+    # shell (common when they've just been running the TypeScript pipeline
+    # against LocalStack), boto3 would honour that env var for every
+    # service — including Bedrock, which doesn't exist in LocalStack. The
+    # symptom is a silent hang inside the adaptive retry loop with zero
+    # error output. Pop the env var here so the Bedrock client resolves to
+    # the real AWS endpoint regardless of shell state. S3 above is already
+    # safe because it takes an explicit `endpoint_url` override.
+    os.environ.pop("AWS_ENDPOINT_URL", None)
     bedrock = boto3.client(
         "bedrock-runtime",
         region_name=config.aws_region,

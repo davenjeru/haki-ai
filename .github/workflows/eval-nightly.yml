@@ -41,7 +41,7 @@ jobs:
           BEDROCK_MODEL_ID: ${{ vars.BEDROCK_MODEL_ID }}
           KNOWLEDGE_BASE_ID: ${{ vars.KNOWLEDGE_BASE_ID }}
           S3_BUCKET: ${{ vars.S3_BUCKET }}
-        run: uv run python -m evals.run --with-ragas
+        run: uv run python -m evals.run --ragas
 
       - name: Upload report
         uses: actions/upload-artifact@v4

@@ -17,12 +17,30 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import boto3
 
 _MAX_WORKERS = 32
+
+
+def _make_s3_client():
+    """Builds an S3 client that honours ENV=local so the LocalStack
+    bucket (populated during dev ingestion) can be rebuilt without
+    touching real AWS."""
+    if os.environ.get("ENV") == "local":
+        host = os.environ.get("LOCALSTACK_HOSTNAME", "localhost")
+        port = os.environ.get("EDGE_PORT", "4566")
+        return boto3.client(
+            "s3",
+            endpoint_url=f"http://{host}:{port}",
+            region_name=os.environ.get("AWS_REGION", "us-east-1"),
+            aws_access_key_id="test",
+            aws_secret_access_key="test",
+        )
+    return boto3.client("s3")
 
 
 def _chunk_id_from_key(key: str, prefix: str) -> str:
@@ -69,7 +87,7 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    s3 = boto3.client("s3")
+    s3 = _make_s3_client()
     output_key = args.output_key or f"{args.prefix}_catalog.json"
 
     print(f"[build_catalog] listing s3://{args.bucket}/{args.prefix} ...")

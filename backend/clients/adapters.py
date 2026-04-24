@@ -157,11 +157,17 @@ class LocalRAGAdapter:
         chroma_port: int = 8000,
         guardrail_id: str = "",
         guardrail_version: str = "",
+        s3_list_client=None,
     ):
         self._bedrock_runtime = bedrock_runtime
         self._bedrock_agent_runtime = bedrock_agent_runtime
         self._embed_model = embed_model
         self._s3_client = s3_client
+        # A dedicated listing client avoids the LocalStack
+        # list_objects_v2 truncation triggered by s3v4 + path addressing.
+        # Falls back to the presign client in tests / prod where the
+        # caller hasn't bothered to build two.
+        self._s3_list_client = s3_list_client or s3_client
         self._s3_bucket = s3_bucket
         self._aws_region = aws_region
         self._guardrail_id = guardrail_id
@@ -182,6 +188,13 @@ class LocalRAGAdapter:
     @property
     def catalog_s3_client(self):
         return self._s3_client
+
+    @property
+    def catalog_list_client(self):
+        """Client to use when listing objects for the chunk catalog.
+        Separate from ``catalog_s3_client`` (which is presign-configured)
+        so LocalStack listings aren't silently truncated."""
+        return self._s3_list_client
 
     @property
     def catalog_bucket(self) -> str:
@@ -293,16 +306,24 @@ class LocalRAGAdapter:
     @staticmethod
     def _chroma_where(metadata_filter: dict | None) -> dict | None:
         """
-        Translates our simple AND-of-equals filter into ChromaDB\u2019s query
-        syntax. Returns None when no filter is provided so we don\u2019t send
-        an empty `where` clause (ChromaDB rejects it).
+        Translates the AND filter dict into ChromaDB\u2019s query syntax.
+        Scalar values become ``$eq``; list/tuple/set values become ``$in``
+        so a domain specialist can scope retrieval to multiple sources
+        in a single query. Returns ``None`` when no filter is provided so
+        we don\u2019t send an empty ``where`` clause (ChromaDB rejects it).
         """
         if not metadata_filter:
             return None
-        if len(metadata_filter) == 1:
-            key, value = next(iter(metadata_filter.items()))
-            return {key: {"$eq": value}}
-        return {"$and": [{k: {"$eq": v}} for k, v in metadata_filter.items()]}
+        clauses = [LocalRAGAdapter._chroma_clause(k, v) for k, v in metadata_filter.items()]
+        if len(clauses) == 1:
+            return clauses[0]
+        return {"$and": clauses}
+
+    @staticmethod
+    def _chroma_clause(key: str, value) -> dict:
+        if isinstance(value, (list, tuple, set)):
+            return {key: {"$in": list(value)}}
+        return {key: {"$eq": value}}
 
 
 class BedrockRAGAdapter:
@@ -324,15 +345,22 @@ class BedrockRAGAdapter:
         config,
         *,
         s3_client,
+        s3_list_client=None,
     ):
         self._bedrock_agent_runtime = bedrock_agent_runtime
         self._bedrock_runtime = bedrock_runtime
         self._config = config
         self._s3_client = s3_client
+        self._s3_list_client = s3_list_client or s3_client
 
     @property
     def catalog_s3_client(self):
         return self._s3_client
+
+    @property
+    def catalog_list_client(self):
+        """Separate client for object listing; see LocalRAGAdapter."""
+        return self._s3_list_client
 
     @property
     def catalog_bucket(self) -> str:
@@ -415,17 +443,29 @@ class BedrockRAGAdapter:
     @staticmethod
     def _kb_filter(metadata_filter: dict | None) -> dict | None:
         """
-        Translates our simple AND-of-equals filter dict to Bedrock KB's
-        `retrievalFilter` JSON:
-          single key  \u2192 {"equals": {"key": "...", "value": "..."}}
-          multi keys  \u2192 {"andAll": [ { "equals": ... }, { "equals": ... } ]}
+        Translates the AND filter dict to Bedrock KB\u2019s ``retrievalFilter``.
+
+          scalar value  \u2192 {"equals": {"key": "...", "value": "..."}}
+          list value    \u2192 {"in":     {"key": "...", "value": [...]}}
+
+        Single-clause filters are returned as-is; multi-clause filters
+        are wrapped in ``andAll``. The ``in`` operator is what lets a
+        domain specialist scope retrieval to e.g. the Penal Code +
+        Criminal Procedure Code + Sexual Offences Act in a single call
+        instead of running three specialists in parallel.
         """
         if not metadata_filter:
             return None
         terms = [
-            {"equals": {"key": k, "value": v}}
+            BedrockRAGAdapter._kb_clause(k, v)
             for k, v in metadata_filter.items()
         ]
         if len(terms) == 1:
             return terms[0]
         return {"andAll": terms}
+
+    @staticmethod
+    def _kb_clause(key: str, value) -> dict:
+        if isinstance(value, (list, tuple, set)):
+            return {"in": {"key": key, "value": list(value)}}
+        return {"equals": {"key": key, "value": value}}

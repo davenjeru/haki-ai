@@ -13,6 +13,7 @@ import io
 import json
 import os
 import sys
+import types
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -997,6 +998,112 @@ class TestBM25Retrieve(unittest.TestCase):
         self.assertTrue(all(r["metadata"].get("chunkType") == "toc" for r in results))
         self.assertTrue(any(r["metadata"]["chunkId"] == "strike" for r in results))
 
+    def test_filter_list_value_matches_any_member(self):
+        # Domain specialists (e.g. criminal = Penal Code + CPC + Sexual
+        # Offences Act) scope retrieval with a list-valued source filter.
+        # Entries whose source matches ANY list member must be kept; all
+        # others must be excluded. This is the symmetric local-BM25 path
+        # to the Bedrock KB ``in`` clause used in prod.
+        tagged = [
+            {**entry, "metadata": {**entry["metadata"], "source": src}}
+            for entry, src in zip(
+                self.catalog,
+                [
+                    "Penal Code (Cap. 63)",
+                    "Employment Act 2007",
+                    "Criminal Procedure Code (Cap. 75)",
+                    "Employment Act 2007",
+                    "Sexual Offences Act 2006",
+                    "Employment Act 2007",
+                ],
+            )
+        ]
+        results = bm25_module.retrieve(
+            "notice",
+            tagged,
+            metadata_filter={
+                "source": [
+                    "Penal Code (Cap. 63)",
+                    "Criminal Procedure Code (Cap. 75)",
+                    "Sexual Offences Act 2006",
+                ],
+            },
+        )
+        returned_sources = {r["metadata"]["source"] for r in results}
+        # Criminal-domain sources only \u2014 no Employment Act leakage.
+        self.assertTrue(
+            returned_sources.issubset({
+                "Penal Code (Cap. 63)",
+                "Criminal Procedure Code (Cap. 75)",
+                "Sexual Offences Act 2006",
+            }),
+            f"unexpected sources in results: {returned_sources}",
+        )
+        self.assertNotIn("Employment Act 2007", returned_sources)
+
+
+class TestAdapterFilterTranslation(unittest.TestCase):
+    """
+    Domain specialists scope retrieval with a list-valued ``source``
+    filter. The two adapters must translate that into their native
+    multi-value syntax so the filter actually reaches the store.
+    """
+
+    def test_bedrock_kb_translates_list_value_to_in_clause(self):
+        from clients.adapters import BedrockRAGAdapter
+
+        clause = BedrockRAGAdapter._kb_filter({
+            "source": ["Penal Code (Cap. 63)", "Criminal Procedure Code (Cap. 75)"],
+        })
+        self.assertEqual(
+            clause,
+            {"in": {"key": "source", "value": [
+                "Penal Code (Cap. 63)",
+                "Criminal Procedure Code (Cap. 75)",
+            ]}},
+        )
+
+    def test_bedrock_kb_scalar_value_still_equals(self):
+        from clients.adapters import BedrockRAGAdapter
+
+        clause = BedrockRAGAdapter._kb_filter({"source": "Employment Act 2007"})
+        self.assertEqual(
+            clause,
+            {"equals": {"key": "source", "value": "Employment Act 2007"}},
+        )
+
+    def test_bedrock_kb_mixes_in_and_equals_under_andall(self):
+        from clients.adapters import BedrockRAGAdapter
+
+        clause = BedrockRAGAdapter._kb_filter({
+            "source": ["A", "B"],
+            "chunkType": "body",
+        })
+        self.assertEqual(clause["andAll"][0]["in"]["value"], ["A", "B"])
+        self.assertEqual(clause["andAll"][1]["equals"]["value"], "body")
+
+    def test_bedrock_kb_none_on_empty(self):
+        from clients.adapters import BedrockRAGAdapter
+        self.assertIsNone(BedrockRAGAdapter._kb_filter(None))
+        self.assertIsNone(BedrockRAGAdapter._kb_filter({}))
+
+    def test_chroma_translates_list_value_to_in_clause(self):
+        from clients.adapters import LocalRAGAdapter
+
+        where = LocalRAGAdapter._chroma_where({
+            "source": ["Marriage Act 2014", "Children Act 2022"],
+        })
+        self.assertEqual(
+            where,
+            {"source": {"$in": ["Marriage Act 2014", "Children Act 2022"]}},
+        )
+
+    def test_chroma_scalar_value_still_eq(self):
+        from clients.adapters import LocalRAGAdapter
+
+        where = LocalRAGAdapter._chroma_where({"source": "Employment Act 2007"})
+        self.assertEqual(where, {"source": {"$eq": "Employment Act 2007"}})
+
 
 class TestRRF(unittest.TestCase):
 
@@ -1128,6 +1235,10 @@ class _StubAdapter:
         return None
 
     @property
+    def catalog_list_client(self):
+        return None
+
+    @property
     def catalog_bucket(self) -> str:
         return "haki-ai-data"
 
@@ -1245,11 +1356,25 @@ class TestSupervisorParsing(unittest.TestCase):
         )
         self.assertEqual(agents, ["land", "constitution"])
 
+    def test_accepts_new_domain_specialists(self):
+        # Corpus expansion added criminal / family / contracts domains.
+        # The parser must accept them as known agents so supervisor
+        # routing actually reaches those specialists instead of the
+        # ``_FALLBACK`` chat path.
+        for name in ("criminal", "family", "contracts"):
+            with self.subTest(agent=name):
+                agents, _ = _parse_routing(
+                    '{"agents": ["' + name + '"], "reason": "domain"}'
+                )
+                self.assertEqual(agents, [name])
+
     def test_chat_is_exclusive(self):
         agents, _ = _parse_routing('{"agents": ["chat", "employment"]}')
         self.assertEqual(agents, ["chat"])
 
     def test_drops_unknown_agents(self):
+        # "tax" is not (yet) a domain specialist; must be dropped while
+        # legitimate agents are preserved in order.
         agents, _ = _parse_routing('{"agents": ["employment", "tax", "land"]}')
         self.assertEqual(agents, ["employment", "land"])
 
@@ -1289,12 +1414,28 @@ class TestSupervisorPromptContent(unittest.TestCase):
         self.assertIn("MUST NOT bias", SUPERVISOR_PROMPT)
 
     def test_describes_each_specialist_by_its_primary_statute(self):
-        # Agents are defined by the primary source they cover, not by an
-        # enumerated list of sub-topics. This keeps the prompt stable as
-        # we add more statutes or edge cases.
-        self.assertIn("Constitution of Kenya 2010", SUPERVISOR_PROMPT)
-        self.assertIn("Employment Act 2007", SUPERVISOR_PROMPT)
-        self.assertIn("Land Act 2012", SUPERVISOR_PROMPT)
+        # Agents are defined by the primary source(s) they cover, not by
+        # an enumerated list of sub-topics. This keeps the prompt stable
+        # as we add more statutes or edge cases. Each domain specialist
+        # must name every statute in its filter so the router can make
+        # informed decisions without us leaking sub-topic hints into the
+        # prompt.
+        required = [
+            "Constitution of Kenya 2010",
+            "Employment Act 2007",
+            "Land Act 2012",
+            "Landlord and Tenant Act (Cap. 301)",
+            "Penal Code (Cap. 63)",
+            "Criminal Procedure Code (Cap. 75)",
+            "Sexual Offences Act 2006",
+            "Marriage Act 2014",
+            "Children Act 2022",
+            "Law of Contract Act",
+            "Consumer Protection Act 2012",
+        ]
+        for source in required:
+            with self.subTest(source=source):
+                self.assertIn(source, SUPERVISOR_PROMPT)
 
     def test_is_free_of_topic_specific_overfits(self):
         # If a prod bug tempts us to patch a specific topic into the prompt
@@ -2397,6 +2538,334 @@ class TestGeneratedCaseJsonl(unittest.TestCase):
         self.assertEqual(parsed.language, "english")
 
 
+class TestMatchContextToChunk(unittest.TestCase):
+    """Reverse-lookup from a RAGAS reference-context string back to the
+    corpus chunk it came from. Pinning every branch because a silent
+    miss in this function was the root cause of the ~30% empty-sources
+    rate we saw in the first generated_set.jsonl."""
+
+    def _corpus(self):
+        from evals.testset_generator import _Chunk
+        return [
+            _Chunk(
+                chunk_id="const-art-14",
+                text="Article 14. A person is a citizen by birth if, on the day of that "
+                     "person's birth, whether or not the person is born in Kenya...",
+                metadata={"source": "Constitution of Kenya 2010", "section": "Article 14"},
+            ),
+            _Chunk(
+                chunk_id="emp-sec-35",
+                text="35. Notice periods for termination of a contract of service. "
+                     "No contract of service not being a contract to perform some "
+                     "specific work...",
+                metadata={"source": "Employment Act 2007", "section": "Section 35"},
+            ),
+            _Chunk(
+                chunk_id="land-sec-152",
+                text="152. Application for eviction order. A landlord may apply to "
+                     "the court for an order to recover possession of land...",
+                metadata={"source": "Land Act 2012", "section": "Section 152"},
+            ),
+        ]
+
+    def _prefix_index(self, corpus):
+        return {c.text[:80]: c for c in corpus if c.text}
+
+    def test_exact_prefix_match(self):
+        from evals.testset_generator import _match_context_to_chunk
+        corpus = self._corpus()
+        ctx = corpus[0].text
+        match = _match_context_to_chunk(ctx, corpus, self._prefix_index(corpus))
+        self.assertIsNotNone(match)
+        self.assertEqual(match.chunk_id, "const-art-14")
+
+    def test_trimmed_header_still_resolves(self):
+        """RAGAS occasionally strips a short leading header (e.g. the
+        statute-name breadcrumb) before storing the context. Whichever
+        fallback strategy picks it up, the match must still return the
+        right chunk — silent empty-sources was the original regression
+        and that's what this pins."""
+        from evals.testset_generator import _match_context_to_chunk
+        corpus = self._corpus()
+        trimmed = corpus[1].text[5:]
+        match = _match_context_to_chunk(trimmed, corpus, self._prefix_index(corpus))
+        self.assertIsNotNone(match)
+        self.assertEqual(match.chunk_id, "emp-sec-35")
+
+    def test_substring_match_when_context_is_middle_slice(self):
+        """Multi-hop synthesiser sometimes concatenates two chunks and
+        stores the joined text as a single reference_context. The
+        substring fallback should recover the chunk whose text fully
+        contains the probe."""
+        from evals.testset_generator import _match_context_to_chunk
+        corpus = self._corpus()
+        ctx = "Article 14. A person is a citizen by birth if, on the day of that person's birth"
+        match = _match_context_to_chunk(ctx, corpus, self._prefix_index(corpus))
+        self.assertIsNotNone(match)
+        self.assertEqual(match.chunk_id, "const-art-14")
+
+    def test_reverse_substring_when_ragas_prepends_summary(self):
+        """When RAGAS wraps the chunk in a generated summary/prefix,
+        the context is longer than the chunk. The reverse-substring
+        fallback must still recover the chunk."""
+        from evals.testset_generator import _match_context_to_chunk
+        corpus = self._corpus()
+        ctx = (
+            "Summary: The following section deals with termination notice. "
+            + corpus[1].text
+            + "\n\nFollow-up note: see also redundancy provisions."
+        )
+        match = _match_context_to_chunk(ctx, corpus, self._prefix_index(corpus))
+        self.assertIsNotNone(match)
+        self.assertEqual(match.chunk_id, "emp-sec-35")
+
+    def test_returns_none_on_no_match(self):
+        from evals.testset_generator import _match_context_to_chunk
+        corpus = self._corpus()
+        match = _match_context_to_chunk(
+            "some unrelated legal text from a statute we never ingested",
+            corpus,
+            self._prefix_index(corpus),
+        )
+        self.assertIsNone(match)
+
+    def test_returns_none_on_empty_input(self):
+        from evals.testset_generator import _match_context_to_chunk
+        corpus = self._corpus()
+        self.assertIsNone(_match_context_to_chunk("", corpus, self._prefix_index(corpus)))
+        self.assertIsNone(_match_context_to_chunk(None, corpus, self._prefix_index(corpus)))  # type: ignore[arg-type]
+
+
+class TestEnrichFromNodes(unittest.TestCase):
+    """Rows whose contexts can't be matched back to a corpus chunk must
+    be dropped, not shipped with empty ``expected_sources``. The eval
+    runner treats an empty sources list as a refusal case and the
+    resulting metrics are misleading — this was the main symptom in
+    the first generated_set.jsonl (9/30 rows had empty citations)."""
+
+    class _Sample:
+        def __init__(self, contexts):
+            self.eval_sample = types.SimpleNamespace(
+                user_input="q", reference="a", reference_contexts=contexts
+            )
+
+    def _corpus(self):
+        from evals.testset_generator import _Chunk
+        return [
+            _Chunk(
+                chunk_id="emp-sec-35",
+                text="35. Notice periods for termination of a contract of service...",
+                metadata={"source": "Employment Act 2007", "section": "Section 35"},
+            ),
+        ]
+
+    def _case(self, cid="gen-001", lang="english"):
+        from evals.testset_generator import GeneratedCase
+        return GeneratedCase(
+            id=cid,
+            category="employment",
+            question="What notice applies to termination?",
+            reference_answer="Section 35.",
+            expected_sources=[],
+            expected_sections=[],
+            language=lang,
+        )
+
+    def test_matched_context_enriches_sources_and_sections(self):
+        from evals.testset_generator import _enrich_from_nodes
+        corpus = self._corpus()
+        testset = types.SimpleNamespace(samples=[self._Sample([corpus[0].text])])
+        enriched, dropped = _enrich_from_nodes([self._case()], testset, corpus)
+        self.assertEqual(dropped, 0)
+        self.assertEqual(len(enriched), 1)
+        self.assertEqual(enriched[0].expected_sources, ["Employment Act 2007"])
+        self.assertEqual(enriched[0].expected_sections, ["Section 35"])
+
+    def test_unmatched_row_is_dropped(self):
+        from evals.testset_generator import _enrich_from_nodes
+        corpus = self._corpus()
+        testset = types.SimpleNamespace(
+            samples=[self._Sample(["context text that does not appear in any chunk whatsoever"])]
+        )
+        enriched, dropped = _enrich_from_nodes([self._case()], testset, corpus)
+        self.assertEqual(dropped, 1)
+        self.assertEqual(enriched, [])
+
+    def test_category_is_reinferred_from_enriched_sources(self):
+        """If the generator-local category was wrong (e.g. defaulted
+        to uncategorised), enrichment must overwrite it with the real
+        statute's category."""
+        from evals.testset_generator import _enrich_from_nodes
+        corpus = self._corpus()
+        wrong = self._case()
+        wrong.category = "uncategorised"
+        testset = types.SimpleNamespace(samples=[self._Sample([corpus[0].text])])
+        enriched, _ = _enrich_from_nodes([wrong], testset, corpus)
+        self.assertEqual(enriched[0].category, "employment")
+
+    def test_mixed_matched_and_unmatched_in_batch(self):
+        from evals.testset_generator import _enrich_from_nodes
+        corpus = self._corpus()
+        good = self._case(cid="gen-good")
+        bad = self._case(cid="gen-bad")
+        testset = types.SimpleNamespace(samples=[
+            self._Sample([corpus[0].text]),
+            self._Sample(["nothing that matches"]),
+        ])
+        enriched, dropped = _enrich_from_nodes([good, bad], testset, corpus)
+        self.assertEqual(dropped, 1)
+        self.assertEqual([c.id for c in enriched], ["gen-good"])
+
+
+class TestLoadCorpusFilter(unittest.TestCase):
+    """``load_corpus`` must skip TOC / preamble / short-title /
+    definitions chunks so RAGAS can't anchor questions on boilerplate.
+    This is the other half of the generated_set.jsonl regression — TOC
+    chunks were the source of rows like ``gen-002`` whose answer said
+    "Section 101(1)" but whose expected_sections said "Section 398"
+    (the TOC chunk's own section metadata)."""
+
+    def _stub_catalog(self):
+        return [
+            {"chunkId": "body-1", "text": "body text about section 35",
+             "metadata": {"source": "Employment Act 2007", "section": "Section 35", "chunkType": "body"}},
+            {"chunkId": "toc-1", "text": "Chapter XLII – 398. Accessories... 399. Related...",
+             "metadata": {"source": "Penal Code (Cap. 63)", "section": "Section 398", "chunkType": "toc"}},
+            {"chunkId": "pre-1", "text": "AN ACT of Parliament...",
+             "metadata": {"source": "Penal Code (Cap. 63)", "chunkType": "preamble"}},
+            {"chunkId": "def-1", "text": "In this Act, unless the context requires...",
+             "metadata": {"source": "Employment Act 2007", "section": "Section 2", "chunkType": "definitions"}},
+            {"chunkId": "short-1", "text": "This Act may be cited as...",
+             "metadata": {"source": "Marriage Act 2014", "section": "Section 1", "chunkType": "short-title"}},
+            {"chunkId": "legacy-1", "text": "older chunk without a chunkType tag",
+             "metadata": {"source": "Landlord and Tenant Act (Cap. 301)", "section": "Section 4"}},
+            {"chunkId": "empty-1", "text": "",
+             "metadata": {"source": "Employment Act 2007", "chunkType": "body"}},
+        ]
+
+    def _config(self):
+        return types.SimpleNamespace(s3_bucket="haki-ai-data")
+
+    def test_only_body_chunks_are_anchorable_by_default(self):
+        from unittest.mock import patch
+        from evals import testset_generator as gen
+
+        with patch.object(gen, "make_s3_listing", return_value=object()), \
+             patch("rag.catalog.get_catalog", return_value=self._stub_catalog()):
+            chunks = gen.load_corpus(self._config())
+
+        ids = {c.chunk_id for c in chunks}
+        self.assertIn("body-1", ids)
+        # Legacy chunks (chunkType missing) default to body for
+        # backwards compat with pre-fix ingests.
+        self.assertIn("legacy-1", ids)
+        for dropped in ("toc-1", "pre-1", "def-1", "short-1", "empty-1"):
+            self.assertNotIn(dropped, ids, f"{dropped} should have been filtered")
+
+    def test_override_anchorable_types_widens_filter(self):
+        """An operator can widen the filter via the kwarg (e.g. to
+        generate questions about definitions for coverage). Body must
+        remain included; only the explicitly listed extra types
+        should join it."""
+        from unittest.mock import patch
+        from evals import testset_generator as gen
+
+        with patch.object(gen, "make_s3_listing", return_value=object()), \
+             patch("rag.catalog.get_catalog", return_value=self._stub_catalog()):
+            chunks = gen.load_corpus(
+                self._config(),
+                anchorable_chunk_types=frozenset({"body", "definitions"}),
+            )
+
+        ids = {c.chunk_id for c in chunks}
+        self.assertIn("body-1", ids)
+        self.assertIn("def-1", ids)
+        self.assertIn("legacy-1", ids)
+        for dropped in ("toc-1", "pre-1", "short-1"):
+            self.assertNotIn(dropped, ids)
+
+
+class TestListingClientFactory(unittest.TestCase):
+    """Pins the presign/listing client split so the chunk-catalog
+    loader can't be silently coupled back into the presign-configured
+    client path.
+
+    We don't assert on internal BotoConfig fields because make_s3 and
+    make_s3_listing happen to paginate equivalently against LocalStack
+    today — the split is a separation-of-concerns guard, not a workaround
+    for a known listing bug. The real bug we hit was a stale
+    `_catalog.json` fast-path; see backend/rag/catalog.py and
+    backend/scripts/build_chunk_catalog.py.
+    """
+
+    def _make_local_config(self):
+        from app.config import Config
+        return Config(
+            is_local=True,
+            localstack_endpoint="http://localhost:4566",
+            aws_region="us-east-1",
+            knowledge_base_id="",
+            guardrail_id="",
+            guardrail_version="DRAFT",
+            bedrock_model_id="",
+            embedding_model_id="amazon.titan-embed-text-v2:0",
+            chroma_host="",
+            chroma_port=8000,
+            s3_bucket="haki-ai-data",
+            checkpoints_table="haki-ai-checkpoints",
+            environment="local",
+            langsmith_ssm_parameter="",
+        )
+
+    def test_make_s3_points_at_localstack_locally(self):
+        from clients import make_s3
+        client = make_s3(self._make_local_config())
+        self.assertEqual(client.meta.endpoint_url, "http://localhost:4566")
+
+    def test_make_s3_listing_points_at_localstack_locally(self):
+        from clients import make_s3_listing
+        client = make_s3_listing(self._make_local_config())
+        self.assertEqual(client.meta.endpoint_url, "http://localhost:4566")
+
+    def test_local_adapter_uses_separate_listing_client(self):
+        """LocalRAGAdapter must expose catalog_list_client distinct
+        from catalog_s3_client when both are supplied, so the pipeline
+        routes listings through whatever client the caller provided."""
+        from clients.adapters import LocalRAGAdapter
+        presign_client = object()
+        list_client = object()
+
+        class _StubChroma:
+            pass
+
+        adapter = LocalRAGAdapter.__new__(LocalRAGAdapter)
+        adapter._bedrock_runtime = None
+        adapter._bedrock_agent_runtime = None
+        adapter._embed_model = ""
+        adapter._s3_client = presign_client
+        adapter._s3_list_client = list_client
+        adapter._s3_bucket = "haki-ai-data"
+        adapter._aws_region = "us-east-1"
+        adapter._guardrail_id = ""
+        adapter._guardrail_version = ""
+        adapter._collection = _StubChroma()
+
+        self.assertIs(adapter.catalog_s3_client, presign_client)
+        self.assertIs(adapter.catalog_list_client, list_client)
+
+    def test_local_adapter_falls_back_when_list_client_absent(self):
+        """Back-compat: callers that only pass s3_client (older tests)
+        still get a working listing client."""
+        from clients.adapters import LocalRAGAdapter
+        presign_client = object()
+
+        adapter = LocalRAGAdapter.__new__(LocalRAGAdapter)
+        adapter._s3_client = presign_client
+        adapter._s3_list_client = presign_client
+
+        self.assertIs(adapter.catalog_list_client, presign_client)
+
+
 # ── Runner ────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -2433,6 +2902,7 @@ if __name__ == "__main__":
         TestDetectLanguageGenerator,
         TestSubsampleStratified,
         TestGeneratedCaseJsonl,
+        TestListingClientFactory,
     ]:
         suite.addTests(loader.loadTestsFromTestCase(cls))
 

@@ -6,13 +6,15 @@ Two-tier design:
   Tier 1 (Supervisor)
     `supervisor.py` routes each user turn to one or more specialists based
     on a cheap Haiku call. Possible specialists: constitution, employment,
-    land, chat.
+    land, criminal, family, contracts, chat.
 
   Tier 2 (Specialist sub-agents)
     Each specialist is a compiled LangGraph subgraph that runs the Phase 1
-    advanced-RAG pipeline filtered to its own statute(s). Specialists share
-    the builder in `specialists.py` \u2014 only their `source` metadata filter
-    and display name differ.
+    advanced-RAG pipeline filtered to one legal **domain** \u2014 a curated
+    set of Kenyan primary sources served by a single Bedrock KB ``in``
+    clause so the specialist sees every statute covering its area of
+    law. Specialists share the builder in `specialists.py` \u2014 only their
+    ``source`` metadata filter and display name differ.
 
 When the supervisor fires \u22652 specialists (cross-cutting questions), the
 `synthesizer.py` node merges their answers into a single unified response

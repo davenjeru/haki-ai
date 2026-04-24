@@ -10,23 +10,21 @@ LangGraph orchestration for Haki AI (Phase 2 two-tier multi-agent).
                          |    supervisor    |  Haiku routing \u2192 selected_agents
                          +--------+---------+
                                   |
-           +----------+-----------+------+
-           |          |           |     |
-           v          v           v     v
-      constitution  employment   land   chat
-      specialist    specialist   specialist  agent
-           \\         |           /          |
-            \\________+__________/           |
-                            |                |
-                            v                              v
-                     +-------------+               +--------------+
-                     | synthesizer |               | synthesizer  |
-                     +------+------+               +------+-------+
-                            |                             |
-                            +--------------+--------------+
-                                           |
-                                           v
-                                       [ END ]
+        +-------+-------+-------+-------+-------+-------+-------+
+        |       |       |       |       |       |       |
+        v       v       v       v       v       v       v
+     const   employ    land   crim    fam   contr   chat
+     agent    agent   agent  agent   agent  agent   agent
+        \\      |        |      |       |      |     /
+         \\_____+________+______+_______+______+____/
+                            |
+                            v
+                     +-------------+
+                     | synthesizer |
+                     +------+------+
+                            |
+                            v
+                        [ END ]
 
 - Parallel fan-out is implemented via conditional edges that Send() the
   supervisor\u2019s state to every selected specialist. Only selected
@@ -61,6 +59,7 @@ from clients import (
     make_comprehend,
     make_dynamodb_table,
     make_s3,
+    make_s3_listing,
 )
 from rag import refresh_presigned_urls
 
@@ -178,6 +177,7 @@ def _make_rag_adapter(
     s3_client,
     bedrock_runtime,
     bedrock_agent_runtime,
+    s3_list_client=None,
 ):
     if config.is_local:
         return LocalRAGAdapter(
@@ -186,6 +186,7 @@ def _make_rag_adapter(
             embed_model=config.embedding_model_id,
             vectorstore_path=_VECTORSTORE_PATH,
             s3_client=s3_client,
+            s3_list_client=s3_list_client,
             s3_bucket=config.s3_bucket,
             aws_region=config.aws_region,
             chroma_host=config.chroma_host,
@@ -198,6 +199,7 @@ def _make_rag_adapter(
         bedrock_runtime=bedrock_runtime,
         config=config,
         s3_client=s3_client,
+        s3_list_client=s3_list_client,
     )
 
 
@@ -236,9 +238,11 @@ def _build_nodes(config):
     bedrock_runtime = make_bedrock_runtime(config)
     bedrock_agent_runtime = make_bedrock_agent_runtime(config)
     s3 = make_s3(config)
+    s3_list = make_s3_listing(config)
     rag_adapter = _make_rag_adapter(
         config,
         s3_client=s3,
+        s3_list_client=s3_list,
         bedrock_runtime=bedrock_runtime,
         bedrock_agent_runtime=bedrock_agent_runtime,
     )

@@ -3,13 +3,23 @@ Specialist agents \u2014 tier 2 of the two-tier system.
 
 Each specialist wraps the Phase 1 advanced-RAG pipeline with a source
 filter and a display name. Specialists share the same build function so
-adding a new statute (e.g. Marriage Act) is a one-line addition to
-`AGENT_REGISTRY`.
+adding a new statute to an existing domain is a one-line edit to the
+filter list in ``AGENT_REGISTRY``.
 
-Agents:
-  - constitution  \u2192 filter(source=\"Constitution of Kenya 2010\")
-  - employment    \u2192 filter(source=\"Employment Act 2007\")
-  - land          \u2192 filter(source=\"Land Act 2012\")
+Specialists are grouped by **legal domain**, not by individual statute,
+so a single RAG call can draw on every primary source covering the same
+area of law. Each domain\u2019s ``source`` filter is a list handed to the
+adapter as a Bedrock KB ``in`` clause (prod) or a ChromaDB ``$in``
+clause (local).
+
+Domains:
+  - constitution  \u2192 Constitution of Kenya 2010
+  - employment    \u2192 Employment Act 2007
+  - land          \u2192 Land Act 2012 + Landlord and Tenant Act (Cap. 301)
+  - criminal      \u2192 Penal Code (Cap. 63) + Criminal Procedure Code
+                    (Cap. 75) + Sexual Offences Act 2006
+  - family        \u2192 Marriage Act 2014 + Children Act 2022
+  - contracts     \u2192 Law of Contract Act + Consumer Protection Act 2012
   - chat          \u2192 does NOT use RAG; runs chat_node.invoke_chat.
 
 A specialist call returns:
@@ -72,15 +82,48 @@ def _is_model_emitted_refusal(text: str) -> bool:
 AGENT_REGISTRY: dict[str, dict] = {
     "constitution": {
         "display_name": "Constitution",
-        "filter": {"source": "Constitution of Kenya 2010"},
+        "filter": {"source": ["Constitution of Kenya 2010"]},
     },
     "employment": {
         "display_name": "Employment",
-        "filter": {"source": "Employment Act 2007"},
+        "filter": {"source": ["Employment Act 2007"]},
     },
     "land": {
-        "display_name": "Land",
-        "filter": {"source": "Land Act 2012"},
+        "display_name": "Land & Tenancy",
+        "filter": {
+            "source": [
+                "Land Act 2012",
+                "Landlord and Tenant Act (Cap. 301)",
+            ],
+        },
+    },
+    "criminal": {
+        "display_name": "Criminal",
+        "filter": {
+            "source": [
+                "Penal Code (Cap. 63)",
+                "Criminal Procedure Code (Cap. 75)",
+                "Sexual Offences Act 2006",
+            ],
+        },
+    },
+    "family": {
+        "display_name": "Family",
+        "filter": {
+            "source": [
+                "Marriage Act 2014",
+                "Children Act 2022",
+            ],
+        },
+    },
+    "contracts": {
+        "display_name": "Contracts & Consumer",
+        "filter": {
+            "source": [
+                "Law of Contract Act",
+                "Consumer Protection Act 2012",
+            ],
+        },
     },
     "chat": {
         "display_name": "Chat",

@@ -50,6 +50,8 @@ PRICE_TABLE: dict[str, dict[str, float]] = {
     "anthropic.claude-3-sonnet":   {"input": 0.003, "output": 0.015},
     "anthropic.claude-3-opus":     {"input": 0.015, "output": 0.075},
     "anthropic.claude-sonnet-4":   {"input": 0.003, "output": 0.015},
+    "anthropic.claude-haiku-4":    {"input": 0.001, "output": 0.005},
+    "anthropic.claude-opus-4":     {"input": 0.015, "output": 0.075},
     # Titan embeddings.
     "amazon.titan-embed-text-v2":  {"input": 0.00002, "output": 0.0},
     "amazon.titan-embed-text-v1":  {"input": 0.0001, "output": 0.0},
@@ -161,7 +163,11 @@ def make_budget_tracking_llm(langchain_llm: Any, tracker: BudgetTracker, model_i
     """Wraps a LangChain ChatBedrock in a RAGAS-compatible LLM that
     records token usage to ``tracker`` after every call.
     """
-    from ragas.llms import LangchainLLMWrapper  # type: ignore
+    # Import from the base module directly: ``ragas.llms.LangchainLLMWrapper``
+    # is a ``DeprecationHelper`` shim (RAGAS ≥0.4) that can't be subclassed
+    # because its ``__init__`` signature rejects the ``langchain_llm``
+    # positional argument.
+    from ragas.llms.base import LangchainLLMWrapper  # type: ignore
 
     class _Tracked(LangchainLLMWrapper):
         async def generate_text(self, prompt, *args, **kwargs):
@@ -193,7 +199,8 @@ def make_budget_tracking_embeddings(
     back to a conservative whitespace-token estimate so the budget
     guard still trips on runaway calls.
     """
-    from ragas.embeddings import LangchainEmbeddingsWrapper  # type: ignore
+    # See note in make_budget_tracking_llm for the .base import rationale.
+    from ragas.embeddings.base import LangchainEmbeddingsWrapper  # type: ignore
 
     class _Tracked(LangchainEmbeddingsWrapper):
         async def embed_query(self, text: str):

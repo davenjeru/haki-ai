@@ -41,7 +41,17 @@ from prompts import SUPERVISOR_PROMPT
 
 
 # Canonical agent names the supervisor may select. Anything else is dropped.
-KNOWN_AGENTS = frozenset({"constitution", "employment", "land", "chat"})
+# Kept in lockstep with ``agents.specialists.AGENT_REGISTRY`` \u2014 adding a new
+# domain specialist requires an entry in both places.
+KNOWN_AGENTS = frozenset({
+    "constitution",
+    "employment",
+    "land",
+    "criminal",
+    "family",
+    "contracts",
+    "chat",
+})
 
 # Fallback when the model returns nothing we can use. ``chat`` is the only
 # safe default: it replies conversationally / bilingually-refuses for

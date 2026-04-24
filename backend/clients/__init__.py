@@ -110,3 +110,21 @@ def make_s3(config: Config):
     if config.is_local:
         return boto3.client("s3", config=boto_cfg, **_localstack_kwargs(config))
     return boto3.client("s3", region_name=config.aws_region, config=boto_cfg)
+
+
+def make_s3_listing(config: Config):
+    """
+    Dedicated S3 client for listing / reading chunk objects.
+
+    Functionally equivalent to :func:`make_s3` in our current LocalStack
+    setup — both happily paginate ``list_objects_v2``. The split exists
+    to keep presigning and bulk listing concerns separate: presigning
+    URLs care about path-style addressing, the catalog loader doesn't,
+    and keeping the listing client plain means future LocalStack /
+    boto3 quirks around signed listings can't silently drop corpus
+    coverage (the way a stale ``_catalog.json`` fast-path already did
+    once for the first 7 new statute ingests).
+    """
+    if config.is_local:
+        return boto3.client("s3", **_localstack_kwargs(config))
+    return boto3.client("s3", region_name=config.aws_region)

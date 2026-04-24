@@ -27,7 +27,7 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 from app.config import Config
-from clients import make_bedrock_runtime, make_s3
+from clients import make_bedrock_runtime, make_s3_listing
 
 from .generation_cost import (
     BudgetTracker,
@@ -39,6 +39,18 @@ log = logging.getLogger(__name__)
 
 _DEFAULT_SUBSAMPLE_SIZE = 200
 _DEFAULT_EMBED_MODEL = "amazon.titan-embed-text-v2:0"
+
+# chunkTypes safe to anchor questions on. Excludes toc/preamble/short-title
+# (boilerplate — questions about them test the chunker, not the retriever),
+# and excludes `definitions` (definitional questions circularly anchor on
+# the Interpretation section, which §5b of the retrieval plan flagged as
+# a retrieval false-positive magnet).
+#
+# Legacy chunks without a chunkType tag (Land Act, Landlord-Tenant, and
+# the FAQ corpus ingested before the boundary-bleed fix) are treated as
+# ``body`` for backwards compatibility, matching ``rag.filters``'
+# ``is_boilerplate`` default.
+_ANCHORABLE_CHUNK_TYPES: frozenset[str] = frozenset({"body"})
 
 
 # ── Persona definitions ────────────────────────────────────────────────────
@@ -74,27 +86,64 @@ class _Chunk:
     metadata: dict[str, Any]
 
 
-def load_corpus(config: Config) -> list[_Chunk]:
+def load_corpus(
+    config: Config,
+    *,
+    anchorable_chunk_types: frozenset[str] = _ANCHORABLE_CHUNK_TYPES,
+) -> list[_Chunk]:
     """Reads the full chunk catalog from S3 (LocalStack when ``is_local``).
 
     Reuses :func:`rag.catalog.get_catalog` so the generator sees the same
     corpus the retriever does — if a chunk isn't retrievable in prod,
     RAGAS shouldn't be allowed to anchor a question on it.
+
+    Filters to ``chunkType in anchorable_chunk_types`` (default: body
+    only). Without this filter RAGAS anchors ~30% of questions on TOC
+    chunks whose metadata lists a single section (e.g. "Section 398")
+    but whose body text reels through every index entry (Sections 101,
+    138, 273, 329, ...). The generated expected_sections then points
+    at the TOC chunk's metadata rather than where the answer actually
+    lives. Chunks missing the chunkType tag (older ingests pre-dating
+    the boundary-bleed fix) default to ``body`` for backwards compat.
     """
     from rag.catalog import get_catalog
 
-    s3 = make_s3(config)
+    s3 = make_s3_listing(config)
     entries = get_catalog(s3, config.s3_bucket)
-    chunks = [
-        _Chunk(
-            chunk_id=e["chunkId"],
-            text=e["text"],
-            metadata=e.get("metadata") or {},
+
+    total = 0
+    skipped_by_type: dict[str, int] = {}
+    chunks: list[_Chunk] = []
+    for e in entries:
+        total += 1
+        text = e.get("text")
+        if not text:
+            continue
+        metadata = e.get("metadata") or {}
+        chunk_type = metadata.get("chunkType") or "body"
+        if chunk_type not in anchorable_chunk_types:
+            skipped_by_type[chunk_type] = skipped_by_type.get(chunk_type, 0) + 1
+            continue
+        chunks.append(
+            _Chunk(
+                chunk_id=e["chunkId"],
+                text=text,
+                metadata=metadata,
+            )
         )
-        for e in entries
-        if e.get("text")
-    ]
-    log.info("loaded %d chunks from s3://%s/processed-chunks/", len(chunks), config.s3_bucket)
+
+    skip_summary = (
+        ", ".join(f"{t}={n}" for t, n in sorted(skipped_by_type.items()))
+        or "none"
+    )
+    log.info(
+        "loaded %d/%d chunks from s3://%s/processed-chunks/ (anchorable=%s, skipped=%s)",
+        len(chunks),
+        total,
+        config.s3_bucket,
+        ",".join(sorted(anchorable_chunk_types)),
+        skip_summary,
+    )
     return chunks
 
 
@@ -155,6 +204,7 @@ def _lazy_imports():
     try:
         from langchain_aws import ChatBedrock, BedrockEmbeddings  # type: ignore
         from langchain_core.documents import Document  # type: ignore
+        from ragas.run_config import RunConfig  # type: ignore
         from ragas.testset import TestsetGenerator  # type: ignore
         from ragas.testset.persona import Persona  # type: ignore
         from ragas.testset.synthesizers import (  # type: ignore
@@ -165,6 +215,7 @@ def _lazy_imports():
             "ChatBedrock": ChatBedrock,
             "BedrockEmbeddings": BedrockEmbeddings,
             "Document": Document,
+            "RunConfig": RunConfig,
             "TestsetGenerator": TestsetGenerator,
             "Persona": Persona,
             "SingleHopSpecificQuerySynthesizer": SingleHopSpecificQuerySynthesizer,
@@ -263,10 +314,14 @@ _SOURCE_TO_CATEGORY = {
     "Employment Act 2007": "employment",
     "Land Registration Act 2012": "land",
     "Land Act 2012": "land",
-    "Landlord and Tenant (Shops, Hotels and Catering Establishments) Act": "land",
+    "Landlord and Tenant Act (Cap. 301)": "tenancy",
     "Sexual Offences Act 2006": "criminal",
-    "Penal Code": "criminal",
-    "Children Act 2022": "children",
+    "Penal Code (Cap. 63)": "criminal",
+    "Criminal Procedure Code (Cap. 75)": "criminal",
+    "Children Act 2022": "family",
+    "Marriage Act 2014": "family",
+    "Law of Contract Act": "contract",
+    "Consumer Protection Act 2012": "consumer",
 }
 
 
@@ -381,24 +436,81 @@ def _map_sample(idx: int, sample: Any) -> GeneratedCase | None:
     )
 
 
+def _match_context_to_chunk(
+    ctx: str,
+    corpus: list[_Chunk],
+    prefix_index: dict[str, _Chunk],
+) -> _Chunk | None:
+    """Best-effort reverse-lookup from a RAGAS reference-context string
+    to the corpus ``_Chunk`` it came from.
+
+    RAGAS 0.2.x stores ``reference_contexts`` as plain strings rather
+    than node references, and it occasionally mutates the text
+    (whitespace collapse, prefix trimming when it concatenates multiple
+    hops, header stripping). A single prefix-match therefore misses
+    ~30% of contexts and silently ships empty ``expected_sources``.
+
+    The strategy below tries four increasingly fuzzy matches. Order
+    matters: earlier strategies are O(1) hash lookups; the substring
+    fallback is O(N) over the corpus and only runs when the faster
+    strategies miss.
+    """
+    if not ctx or not isinstance(ctx, str):
+        return None
+
+    # 1. Exact prefix(80). Hits the common case in O(1).
+    match = prefix_index.get(ctx[:80])
+    if match is not None:
+        return match
+
+    # 2. Exact prefix(40). Covers cases where RAGAS trimmed a short
+    # prefix (e.g. a header line) before storing.
+    short_prefix = ctx[:40]
+    for key, chunk in prefix_index.items():
+        if key.startswith(short_prefix):
+            return chunk
+
+    # 3. Substring match: first 120 chars of the context appear
+    # verbatim inside a chunk. Handles RAGAS' "glue two chunks" hops
+    # where ``ctx`` = ``chunk_A.text + "\n\n" + chunk_B.text`` and
+    # the prefix is part of chunk_A's middle.
+    probe = ctx[:120].strip()
+    if len(probe) >= 60:
+        for chunk in corpus:
+            if chunk.text and probe in chunk.text:
+                return chunk
+
+    # 4. Reverse substring: a chunk's first 120 chars appear inside
+    # the context. Handles the inverse: RAGAS prepended its own summary
+    # + the full chunk text.
+    for chunk in corpus:
+        if chunk.text and len(chunk.text) >= 60:
+            head = chunk.text[:120].strip()
+            if head and head in ctx:
+                return chunk
+
+    return None
+
+
 def _enrich_from_nodes(
     cases: list[GeneratedCase],
     testset: Any,
     corpus: list[_Chunk],
-) -> list[GeneratedCase]:
+) -> tuple[list[GeneratedCase], int]:
     """Fills ``expected_sources`` / ``expected_sections`` by matching
     each case's ``reference_contexts`` text back to chunk metadata.
 
-    RAGAS 0.2.x returns contexts as raw strings rather than as node
-    references, so we do a best-effort reverse-lookup: for each context
-    string, find the corpus chunk whose text starts with the same 80
-    chars. O(N·M) but N is a few dozen and M is 200–1000, so it's
-    negligible compared to the LLM calls we just made.
+    Returns ``(enriched_cases, dropped)`` where ``dropped`` counts rows
+    whose contexts couldn't be matched to any corpus chunk — those
+    rows are omitted rather than shipped with empty citations, because
+    downstream eval scoring treats an empty ``expected_sources`` as a
+    refusal case and computes misleading metrics against it.
     """
     prefix_index = {c.text[:80]: c for c in corpus if c.text}
 
     samples = list(getattr(testset, "samples", []) or [])
     enriched: list[GeneratedCase] = []
+    dropped = 0
     for case, sample in zip(cases, samples):
         eval_sample = getattr(sample, "eval_sample", sample)
         contexts = (
@@ -408,11 +520,11 @@ def _enrich_from_nodes(
         )
         sources: list[str] = []
         sections: list[str] = []
+        unmatched_ctxs = 0
         for ctx in contexts:
-            if not isinstance(ctx, str):
-                continue
-            match = prefix_index.get(ctx[:80])
+            match = _match_context_to_chunk(ctx, corpus, prefix_index)
             if match is None:
+                unmatched_ctxs += 1
                 continue
             src = match.metadata.get("source")
             sec = match.metadata.get("section")
@@ -420,10 +532,22 @@ def _enrich_from_nodes(
                 sources.append(src)
             if sec and sec not in sections:
                 sections.append(sec)
+
+        if not sources:
+            log.warning(
+                "dropping %s: enrichment found no source chunk "
+                "(contexts=%d, unmatched=%d)",
+                case.id,
+                len(contexts),
+                unmatched_ctxs,
+            )
+            dropped += 1
+            continue
+
         enriched.append(
             GeneratedCase(
                 id=case.id,
-                category=_infer_category(sources) if sources else case.category,
+                category=_infer_category(sources),
                 question=case.question,
                 reference_answer=case.reference_answer,
                 expected_sources=sources,
@@ -431,10 +555,18 @@ def _enrich_from_nodes(
                 language=case.language,
             )
         )
-    # Any cases beyond what ``samples`` covered (shouldn't happen, but
-    # defensive) pass through unchanged.
-    enriched.extend(cases[len(samples):])
-    return enriched
+
+    # Any cases beyond what ``samples`` covered (shouldn't happen,
+    # defensive) pass through unchanged — they have empty sources
+    # already and will fail the same filter above if we ever reach
+    # this path, but we keep it here to avoid swallowing edge cases.
+    for extra in cases[len(samples):]:
+        if extra.expected_sources:
+            enriched.append(extra)
+        else:
+            dropped += 1
+
+    return enriched, dropped
 
 
 # ── Public entrypoint ───────────────────────────────────────────────────────
@@ -494,11 +626,23 @@ def generate_testset(
 
     trace_id_holder: dict[str, str | None] = {"id": None}
 
+    # Bedrock on-demand quotas for Claude Haiku 4.5 in us-east-1 are
+    # tight enough (~200 RPM account-wide) that the RAGAS default
+    # max_workers=16 trips ThrottlingException after ~60-90s of KG
+    # extraction. Cap workers to 4 and bump retries so transient
+    # throttles recover instead of aborting a paid run.
+    run_config = lib["RunConfig"](
+        max_workers=4,
+        max_retries=8,
+        timeout=300,
+    )
+
     def _invoke_generator():
         testset = generator.generate_with_langchain_docs(
             documents=documents,
             testset_size=size,
             query_distribution=distribution,
+            run_config=run_config,
         )
         if get_current_run_tree is not None:
             rt = get_current_run_tree()
@@ -527,11 +671,17 @@ def generate_testset(
     else:
         testset = _invoke_generator()
 
-    # Map → enrich → drop-empties
+    # Map → enrich → drop unmatched
     samples = list(getattr(testset, "samples", []) or [])
     raw_cases = [_map_sample(i + 1, s) for i, s in enumerate(samples)]
     raw_cases = [c for c in raw_cases if c is not None]
-    cases = _enrich_from_nodes(raw_cases, testset, corpus)
+    cases, dropped = _enrich_from_nodes(raw_cases, testset, corpus)
+    if dropped:
+        log.warning(
+            "dropped %d/%d generated rows with unmatchable reference contexts",
+            dropped,
+            len(raw_cases),
+        )
 
     return GenerationResult(
         cases=cases,

@@ -14,9 +14,13 @@ advanced RAG pipeline (hybrid retrieval + rerank) over Bedrock Claude.
 - RAG: pre-chunking pipeline (TypeScript + LiteParse OCR + Haiku
   extraction) → Bedrock KB over S3 Vectors → advanced-RAG pipeline
   (query expansion, hybrid BM25+dense, RRF, TOC filter, Cohere rerank).
-- Data sources: Kenyan Acts (Constitution 2010, Employment 2007,
-  Land 2012) as committed PDFs, processed into chunks with a
-  filterable `source` metadata key.
+- Data sources: Kenyan primary sources as committed PDFs, processed
+  into chunks with a filterable `source` metadata key. The corpus
+  covers the Constitution of Kenya 2010, the Employment Act 2007,
+  the Land Act 2012 + Landlord and Tenant Act (Cap. 301), the Penal
+  Code (Cap. 63) + Criminal Procedure Code (Cap. 75) + Sexual
+  Offences Act 2006, the Marriage Act 2014 + Children Act 2022, and
+  the Law of Contract Act + Consumer Protection Act 2012.
 - Evaluation: RAGAS (faithfulness / answer_relevancy /
   context_precision / context_recall) + LLM-as-judge on 4 axes.
 - IaC: Terraform modular. GitHub Actions for CI, deploy, nightly evals.
@@ -73,10 +77,16 @@ flowchart LR
   sup -->|1–3 specialists| fan{{Send fan-out}}
   fan --> c[ConstitutionAgent]
   fan --> e[EmploymentAgent]
-  fan --> l[LandAgent]
+  fan --> l[Land & TenancyAgent]
+  fan --> cr[CriminalAgent]
+  fan --> fm[FamilyAgent]
+  fan --> co[Contracts & ConsumerAgent]
   c --> pipe[rag.pipeline]
   e --> pipe
   l --> pipe
+  cr --> pipe
+  fm --> pipe
+  co --> pipe
   pipe --> syn[synthesizer]
   chat --> syn
   syn --> outn[response + citations + language]
@@ -137,10 +147,15 @@ parity holds.
 ### Two-tier multi-agent (Phase 2)
 `SupervisorRouter` (Haiku, JSON) picks 1–3 specialists or `chat`.
 Each specialist is a sub-agent that runs the advanced-RAG pipeline
-scoped by `source` filter. `Synthesizer` merges ≥2 specialist
-outputs; single-specialist turns pass through verbatim. Fan-out uses
-LangGraph's `Send()` with an `operator.add` reducer on
-`specialist_outputs`.
+scoped to a **legal domain** via a list-valued `source` filter
+(Bedrock KB `in` clause in prod, Chroma `$in` locally) so a single
+specialist can span every statute covering its area of law. Current
+domains: `constitution`, `employment`, `land` (Land Act + Cap. 301),
+`criminal` (Penal Code + CPC + Sexual Offences), `family` (Marriage
++ Children), `contracts` (Contract Act + Consumer Protection).
+`Synthesizer` merges ≥2 specialist outputs; single-specialist turns
+pass through verbatim. Fan-out uses LangGraph's `Send()` with a
+per-turn-reset reducer on `specialist_outputs`.
 
 ### Evaluation harness (Phase 3)
 30-question golden set, RAGAS (optional dep), LLM-as-judge on 4 axes,

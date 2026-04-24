@@ -73,6 +73,8 @@ class RAGAdapterLike(Protocol):
     @property
     def catalog_s3_client(self): ...
     @property
+    def catalog_list_client(self): ...
+    @property
     def bedrock_agent_runtime(self): ...
     @property
     def bedrock_runtime(self): ...
@@ -109,7 +111,7 @@ def run_rag(
 
     # 2. Dense + BM25 retrieval per variant.
     catalog = get_catalog(
-        rag_adapter.catalog_s3_client,
+        rag_adapter.catalog_list_client,
         rag_adapter.catalog_bucket,
     )
 

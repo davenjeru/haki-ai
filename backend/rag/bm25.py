@@ -85,10 +85,15 @@ def retrieve(
           "score":    float,
         }
 
-    metadata_filter is an AND-of-equals dict \u2014 e.g.
-    `{"source": "Employment Act 2007"}`. Entries whose metadata does not
-    match every key/value are excluded before scoring so the BM25
-    normalisation reflects the filtered corpus, not the whole corpus.
+    metadata_filter is an AND dict where each value is either a scalar
+    (exact match) or a list (OR across members). Examples:
+
+        {"source": "Employment Act 2007"}                   # single-statute
+        {"source": ["Penal Code (Cap. 63)",                 # domain specialist
+                    "Criminal Procedure Code (Cap. 75)"]}
+
+    Entries that don\u2019t match every key are excluded before scoring so the
+    BM25 normalisation reflects the filtered corpus, not the whole corpus.
     """
     query = (query or "").strip()
     if not query or not catalog:
@@ -140,6 +145,18 @@ def _apply_filter(catalog: list[dict], metadata_filter: dict | None) -> list[dic
     out: list[dict] = []
     for entry in catalog:
         meta = entry.get("metadata") or {}
-        if all(meta.get(k) == v for k, v in metadata_filter.items()):
+        if all(_matches(meta.get(k), v) for k, v in metadata_filter.items()):
             out.append(entry)
     return out
+
+
+def _matches(meta_value, expected) -> bool:
+    """
+    AND-of-clauses filter primitive. A list/tuple/set on the RHS means
+    "OR across the members" so domain specialists can scope the corpus
+    to multiple statutes at once (e.g. ``{"source": [Penal, CPC]}``).
+    A scalar means strict equality, preserving the previous behaviour.
+    """
+    if isinstance(expected, (list, tuple, set)):
+        return meta_value in expected
+    return meta_value == expected
