@@ -11,6 +11,10 @@ dependencies = [
     # the advanced-RAG hybrid retriever. ~20KB wheel, loads in-process in
     # Lambda with zero cold-start penalty beyond the import itself.
     "rank-bm25>=0.2.2",
+    # PyJWT[crypto] verifies Clerk session JWTs (RS256) against the JWKS
+    # published at {frontend_api}/.well-known/jwks.json. ~1MB in the layer,
+    # pure-Python wrapper over cryptography (already a transitive dep).
+    "pyjwt[crypto]>=2.9.0",
 ]
 
 # Local-only deps — chromadb pulls ~50MB of native wheels (hnswlib, onnx)

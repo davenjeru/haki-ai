@@ -107,7 +107,8 @@ jobs:
       - name: Terraform apply
         working-directory: infra
         env:
-          TF_VAR_langsmith_api_key: ${{ secrets.LANGSMITH_API_KEY }}
+          TF_VAR_langsmith_api_key:     ${{ secrets.LANGSMITH_API_KEY }}
+          TF_VAR_clerk_publishable_key: ${{ vars.VITE_CLERK_PUBLISHABLE_KEY }}
         run: terraform apply -auto-approve
 
       - name: Capture outputs

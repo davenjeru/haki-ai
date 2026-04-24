@@ -30,6 +30,9 @@ pipeline/volume/
 # Cursor local settings (workspace MCP config holds API keys)
 .cursor/
 
+# Agent skills — installed by `npx skills add`; reproducible from skills-lock.json
+.agents/
+
 # Eval harness outputs (generated; only the directory itself is tracked)
 backend/evals/reports/*
 !backend/evals/reports/.gitkeep

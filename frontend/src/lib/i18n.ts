@@ -24,8 +24,6 @@ const en = {
   'chat.placeholder.sw': 'Uliza kuhusu sheria za Kenya kwa Kiswahili…',
   'chat.placeholder.mixed': 'Ask in English or Swahili — Uliza kwa Kiingereza au Kiswahili…',
   'chat.disclaimer': 'Not legal advice. Verify citations against official sources.',
-  'chat.clear': 'Clear chat',
-  'chat.clear.tooltip': 'Start a new conversation',
 
   'composer.label': 'Your question',
   'composer.send': 'Send',
@@ -38,6 +36,21 @@ const en = {
   'source.empty.unavailable': 'No source page available for this citation.',
 
   'citations.heading': 'Citations',
+
+  'sidebar.label': 'Chat history',
+  'sidebar.heading': 'Your chats',
+  'sidebar.list.label': 'Previous chats',
+  'sidebar.newChat': 'New chat',
+  'sidebar.collapse': 'Collapse sidebar',
+  'sidebar.expand': 'Expand sidebar',
+  'sidebar.loading': 'Loading chats…',
+  'sidebar.empty': 'No chats yet. Ask something to start one.',
+  'sidebar.signedOut.prompt': 'Sign in to keep a history of your chats.',
+  'sidebar.renameTooltip': 'Rename chat',
+  'sidebar.renameAria': 'Chat title',
+
+  'auth.signIn': 'Sign in',
+  'auth.signUp': 'Create account',
 
   'errors.generic': 'Something went wrong',
 } as const
@@ -56,8 +69,6 @@ const sw: Record<I18nKey, string> = {
   'chat.placeholder.sw': 'Uliza kuhusu sheria za Kenya kwa Kiswahili…',
   'chat.placeholder.mixed': 'Ask in English or Swahili — Uliza kwa Kiingereza au Kiswahili…',
   'chat.disclaimer': 'Si ushauri wa kisheria. Hakikisha manukuu dhidi ya vyanzo rasmi.',
-  'chat.clear': 'Futa mazungumzo',
-  'chat.clear.tooltip': 'Anza mazungumzo mapya',
 
   'composer.label': 'Swali lako',
   'composer.send': 'Tuma',
@@ -70,6 +81,21 @@ const sw: Record<I18nKey, string> = {
   'source.empty.unavailable': 'Hakuna ukurasa wa chanzo kwa manukuu haya.',
 
   'citations.heading': 'Manukuu',
+
+  'sidebar.label': 'Historia ya mazungumzo',
+  'sidebar.heading': 'Mazungumzo yako',
+  'sidebar.list.label': 'Mazungumzo ya awali',
+  'sidebar.newChat': 'Mazungumzo mapya',
+  'sidebar.collapse': 'Funga kando',
+  'sidebar.expand': 'Fungua kando',
+  'sidebar.loading': 'Inapakia mazungumzo…',
+  'sidebar.empty': 'Hakuna mazungumzo bado. Uliza swali kuanza.',
+  'sidebar.signedOut.prompt': 'Ingia ili kuhifadhi historia ya mazungumzo yako.',
+  'sidebar.renameTooltip': 'Badilisha jina',
+  'sidebar.renameAria': 'Jina la mazungumzo',
+
+  'auth.signIn': 'Ingia',
+  'auth.signUp': 'Fungua akaunti',
 
   'errors.generic': 'Hitilafu imetokea',
 }

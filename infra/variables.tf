@@ -75,6 +75,12 @@ variable "langsmith_endpoint" {
   default     = "https://api.smith.langchain.com"
 }
 
+variable "clerk_publishable_key" {
+  description = "Clerk publishable key (pk_test_* / pk_live_*). Public value — encoded into the Lambda env so the backend can derive the JWKS URL for verifying signed-in requests. Empty disables signed-in-only routes."
+  type        = string
+  default     = ""
+}
+
 variable "cloudfront_price_class" {
   description = "CloudFront price class for the web distribution. PriceClass_100 = cheapest (US/CA/EU)."
   type        = string

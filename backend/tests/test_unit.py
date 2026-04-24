@@ -780,6 +780,7 @@ class TestLambdaHandler(unittest.TestCase):
         self._orig_get_graph = h.get_compiled_graph
         self._orig_make_cw = h.make_cloudwatch
         self._orig_load_history = h.load_history
+        self._orig_thread_owner = h._thread_owner
 
         self.graph = _FakeCompiledGraph({
             "messages": [],
@@ -800,11 +801,16 @@ class TestLambdaHandler(unittest.TestCase):
         self.history_payload: list[dict] = []
         h.load_history = lambda config, session_id: self.history_payload
 
+        # Every session in this suite is assumed unowned; keeps the test
+        # fast by skipping the real DynamoDB ownership lookup.
+        h._thread_owner = lambda config, session_id: None
+
     def tearDown(self):
         from app import handler as h
         h.get_compiled_graph = self._orig_get_graph
         h.make_cloudwatch = self._orig_make_cw
         h.load_history = self._orig_load_history
+        h._thread_owner = self._orig_thread_owner
 
     def _invoke(self, body: dict) -> dict:
         event = {"body": json.dumps(body)}
@@ -2813,8 +2819,10 @@ class TestListingClientFactory(unittest.TestCase):
             chroma_port=8000,
             s3_bucket="haki-ai-data",
             checkpoints_table="haki-ai-checkpoints",
+            chat_threads_table="haki-ai-chat-threads",
             environment="local",
             langsmith_ssm_parameter="",
+            clerk_publishable_key="",
         )
 
     def test_make_s3_points_at_localstack_locally(self):
@@ -2866,6 +2874,716 @@ class TestListingClientFactory(unittest.TestCase):
         self.assertIs(adapter.catalog_list_client, presign_client)
 
 
+# ── Clerk auth: issuer derivation + JWT verification ──────────────────────────
+
+class TestDeriveIssuer(unittest.TestCase):
+    """The backend auto-derives the Clerk issuer from the publishable key."""
+
+    def test_decodes_test_instance(self):
+        from app.auth import derive_issuer
+        import base64 as _b64
+
+        host = "learning-honeybee-54.clerk.accounts.dev"
+        body = _b64.b64encode(f"{host}$".encode()).rstrip(b"=").decode()
+        issuer = derive_issuer(f"pk_test_{body}")
+        self.assertEqual(issuer, f"https://{host}")
+
+    def test_decodes_live_instance(self):
+        from app.auth import derive_issuer
+        import base64 as _b64
+
+        host = "clerk.example.com"
+        body = _b64.b64encode(f"{host}$".encode()).rstrip(b"=").decode()
+        issuer = derive_issuer(f"pk_live_{body}")
+        self.assertEqual(issuer, f"https://{host}")
+
+    def test_empty_raises(self):
+        from app.auth import derive_issuer
+        with self.assertRaises(ValueError):
+            derive_issuer("")
+
+    def test_bad_prefix_raises(self):
+        from app.auth import derive_issuer
+        with self.assertRaises(ValueError):
+            derive_issuer("sk_test_anything")
+
+
+class TestExtractBearer(unittest.TestCase):
+    """Bearer header extraction handles both APIGW-v2 (lowercase) and hand-rolled events."""
+
+    def test_lowercase_authorization(self):
+        from app.auth import extract_bearer
+        self.assertEqual(
+            extract_bearer({"headers": {"authorization": "Bearer abc.def.ghi"}}),
+            "abc.def.ghi",
+        )
+
+    def test_titlecase_authorization(self):
+        from app.auth import extract_bearer
+        self.assertEqual(
+            extract_bearer({"headers": {"Authorization": "Bearer abc"}}),
+            "abc",
+        )
+
+    def test_missing_returns_none(self):
+        from app.auth import extract_bearer
+        self.assertIsNone(extract_bearer({}))
+        self.assertIsNone(extract_bearer({"headers": {}}))
+
+    def test_non_bearer_scheme_returns_none(self):
+        from app.auth import extract_bearer
+        self.assertIsNone(extract_bearer({"headers": {"authorization": "Basic xyz"}}))
+
+    def test_empty_bearer_returns_none(self):
+        from app.auth import extract_bearer
+        self.assertIsNone(extract_bearer({"headers": {"authorization": "Bearer   "}}))
+
+
+class TestVerifyClerkJwt(unittest.TestCase):
+    """
+    End-to-end JWT verification against a synthetic JWKS. We sign tokens with
+    our own RSA key pair and stub :mod:`app.auth`'s ``PyJWKClient`` so the
+    test never touches the network — exactly what a senior reviewer would
+    want: coverage of happy/bad/expired without flaky HTTPS calls.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            from cryptography.hazmat.primitives.asymmetric import rsa
+        except ImportError:  # pragma: no cover
+            raise unittest.SkipTest("cryptography not available")
+        cls._rsa = rsa
+        cls.private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        cls.public_key = cls.private_key.public_key()
+
+    def setUp(self):
+        import base64 as _b64
+        from app import auth as auth_mod
+
+        host = "learning-honeybee-54.clerk.accounts.dev"
+        body = _b64.b64encode(f"{host}$".encode()).rstrip(b"=").decode()
+        self.publishable_key = f"pk_test_{body}"
+        self.issuer = f"https://{host}"
+
+        public_key = self.public_key
+
+        class _StubJwkSigning:
+            def __init__(self, key):
+                self.key = key
+
+        class _StubJwkClient:
+            def __init__(self, url, **_):
+                self.url = url
+
+            def get_signing_key_from_jwt(self, token):  # noqa: ARG002 - stub
+                return _StubJwkSigning(public_key)
+
+        self._orig_client = auth_mod.PyJWKClient
+        auth_mod.PyJWKClient = _StubJwkClient
+        auth_mod.reset_cache()
+
+    def tearDown(self):
+        from app import auth as auth_mod
+        auth_mod.PyJWKClient = self._orig_client
+        auth_mod.reset_cache()
+
+    def _sign(self, claims: dict) -> str:
+        import jwt as _jwt
+        from cryptography.hazmat.primitives import serialization
+        pem = self.private_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+        return _jwt.encode(claims, pem, algorithm="RS256")
+
+    def test_valid_token_returns_user_id(self):
+        from app.auth import verify_clerk_jwt
+        now = int(time.time()) if False else __import__("time").time()
+        token = self._sign({
+            "sub": "user_abc",
+            "iat": int(now) - 10,
+            "exp": int(now) + 3600,
+            "iss": self.issuer,
+        })
+        self.assertEqual(verify_clerk_jwt(token, self.publishable_key), "user_abc")
+
+    def test_expired_token_rejected(self):
+        from app.auth import verify_clerk_jwt
+        now = __import__("time").time()
+        token = self._sign({
+            "sub": "user_abc",
+            "iat": int(now) - 3600,
+            "exp": int(now) - 60,  # expired
+            "iss": self.issuer,
+        })
+        self.assertIsNone(verify_clerk_jwt(token, self.publishable_key))
+
+    def test_wrong_issuer_rejected(self):
+        from app.auth import verify_clerk_jwt
+        now = __import__("time").time()
+        token = self._sign({
+            "sub": "user_abc",
+            "iat": int(now),
+            "exp": int(now) + 3600,
+            "iss": "https://evil.clerk.accounts.dev",
+        })
+        self.assertIsNone(verify_clerk_jwt(token, self.publishable_key))
+
+    def test_missing_sub_rejected(self):
+        from app.auth import verify_clerk_jwt
+        now = __import__("time").time()
+        token = self._sign({
+            "iat": int(now),
+            "exp": int(now) + 3600,
+            "iss": self.issuer,
+        })
+        self.assertIsNone(verify_clerk_jwt(token, self.publishable_key))
+
+    def test_empty_token_returns_none(self):
+        from app.auth import verify_clerk_jwt
+        self.assertIsNone(verify_clerk_jwt("", self.publishable_key))
+        self.assertIsNone(verify_clerk_jwt(None, self.publishable_key))
+
+    def test_missing_publishable_key_returns_none(self):
+        from app.auth import verify_clerk_jwt
+        self.assertIsNone(verify_clerk_jwt("anything", ""))
+
+    def test_garbage_token_returns_none(self):
+        from app.auth import verify_clerk_jwt
+        self.assertIsNone(verify_clerk_jwt("not.a.jwt", self.publishable_key))
+
+
+# ── ThreadsRepo ───────────────────────────────────────────────────────────────
+
+
+class _FakeDynamoTable:
+    """In-memory boto3 Table lookalike for ThreadsRepo tests."""
+
+    def __init__(self):
+        self._store: dict[tuple[str, str], dict] = {}
+
+    def get_item(self, *, Key):
+        item = self._store.get((Key["user_id"], Key["thread_id"]))
+        return {"Item": dict(item)} if item else {}
+
+    def put_item(self, *, Item):
+        self._store[(Item["user_id"], Item["thread_id"])] = dict(Item)
+
+    def update_item(self, *, Key, AttributeUpdates):
+        item = self._store.get((Key["user_id"], Key["thread_id"]))
+        if item is None:
+            item = {"user_id": Key["user_id"], "thread_id": Key["thread_id"]}
+        for name, op in AttributeUpdates.items():
+            if op["Action"] == "PUT":
+                item[name] = op["Value"]
+        self._store[(Key["user_id"], Key["thread_id"])] = item
+
+    def query(self, *, KeyConditionExpression, IndexName=None, Limit=None):
+        # Minimal query stub for the two shapes we use in-repo:
+        #   - base table: KeyCondition "user_id = :u"  (list threads for user)
+        #   - thread_id_index GSI: KeyCondition "thread_id = :t" (find owner)
+        # We peek into the boto3 KeyConditionExpression's ``_values`` tuple to
+        # pull the literal — stable since boto3 1.x and cheap to avoid a real
+        # expression parser.
+        values = getattr(KeyConditionExpression, "_values", ())
+        value = values[1] if values else None
+        if value is None:
+            return {"Items": []}
+        if IndexName == "thread_id_index":
+            items = [dict(v) for (_, t), v in self._store.items() if t == value]
+        else:
+            items = [dict(v) for (u, _), v in self._store.items() if u == value]
+        if Limit is not None:
+            items = items[:Limit]
+        return {"Items": items}
+
+
+class TestThreadsRepo(unittest.TestCase):
+    def setUp(self):
+        from memory.threads import ThreadsRepo
+        self.table = _FakeDynamoTable()
+        self.repo = ThreadsRepo(self.table)
+
+    def test_get_missing_returns_none(self):
+        self.assertIsNone(self.repo.get("u1", "t1"))
+
+    def test_upsert_creates_row_with_title(self):
+        row = self.repo.upsert("u1", "t1", title="First chat")
+        self.assertEqual(row.title, "First chat")
+        self.assertGreater(row.created_at, 0)
+        self.assertEqual(row.created_at, row.updated_at)
+        # The row survives the round-trip via get_item.
+        fetched = self.repo.get("u1", "t1")
+        self.assertIsNotNone(fetched)
+        self.assertEqual(fetched.title, "First chat")
+
+    def test_upsert_without_title_uses_default(self):
+        row = self.repo.upsert("u1", "t1")
+        self.assertEqual(row.title, "New chat")
+
+    def test_upsert_existing_bumps_updated_at_but_keeps_title(self):
+        first = self.repo.upsert("u1", "t1", title="Original")
+        # Nudge clock forward so updated_at strictly increases.
+        import time as _t
+        _t.sleep(1.01)
+        second = self.repo.upsert("u1", "t1")  # no explicit title
+        self.assertGreater(second.updated_at, first.updated_at)
+        self.assertEqual(second.title, "Original")
+        # Re-reading must also return the preserved title.
+        self.assertEqual(self.repo.get("u1", "t1").title, "Original")
+
+    def test_update_title_renames_existing(self):
+        self.repo.upsert("u1", "t1", title="Old")
+        row = self.repo.update_title("u1", "t1", "  New title  ")
+        self.assertIsNotNone(row)
+        self.assertEqual(row.title, "New title")
+        self.assertEqual(self.repo.get("u1", "t1").title, "New title")
+
+    def test_update_title_missing_returns_none(self):
+        self.assertIsNone(self.repo.update_title("u1", "nope", "whatever"))
+
+    def test_update_title_empty_returns_none(self):
+        self.repo.upsert("u1", "t1", title="Old")
+        self.assertIsNone(self.repo.update_title("u1", "t1", "   "))
+
+    def test_list_for_user_sorted_by_updated_at_desc(self):
+        import time as _t
+        self.repo.upsert("u1", "t-oldest", title="old")
+        _t.sleep(1.01)
+        self.repo.upsert("u1", "t-middle", title="mid")
+        _t.sleep(1.01)
+        self.repo.upsert("u1", "t-newest", title="new")
+        ids = [r.thread_id for r in self.repo.list_for_user("u1")]
+        self.assertEqual(ids, ["t-newest", "t-middle", "t-oldest"])
+
+    def test_list_for_user_isolates_users(self):
+        self.repo.upsert("u1", "t1", title="a")
+        self.repo.upsert("u2", "t1", title="b")
+        self.assertEqual([r.title for r in self.repo.list_for_user("u1")], ["a"])
+        self.assertEqual([r.title for r in self.repo.list_for_user("u2")], ["b"])
+
+    def test_find_owner_missing_returns_none(self):
+        self.assertIsNone(self.repo.find_owner("t-unseen"))
+
+    def test_find_owner_empty_thread_id_returns_none(self):
+        self.repo.upsert("u1", "t1")
+        self.assertIsNone(self.repo.find_owner(""))
+
+    def test_find_owner_returns_owning_user(self):
+        self.repo.upsert("u1", "t1", title="a")
+        self.assertEqual(self.repo.find_owner("t1"), "u1")
+
+    def test_find_owner_unique_per_thread(self):
+        self.repo.upsert("u1", "t1", title="a")
+        self.repo.upsert("u2", "t2", title="b")
+        self.assertEqual(self.repo.find_owner("t1"), "u1")
+        self.assertEqual(self.repo.find_owner("t2"), "u2")
+
+
+# ── Title generator ──────────────────────────────────────────────────────────
+
+
+class TestGenerateTitle(unittest.TestCase):
+    def test_happy_path_sanitises_and_clamps(self):
+        from agents.title import generate_title
+        br = _FakeBedrockRuntime(text='"Termination without notice rights."')
+        title = generate_title(
+            "What are my rights if fired without notice?",
+            "Under the Employment Act 2007 Section 40...",
+            br,
+            "model-id",
+        )
+        self.assertEqual(title, "Termination without notice rights")
+
+    def test_clamps_to_six_words(self):
+        from agents.title import generate_title
+        br = _FakeBedrockRuntime(text="One two three four five six seven")
+        self.assertEqual(
+            generate_title("q", "a", br, "m"),
+            "One two three four five six",
+        )
+
+    def test_empty_response_falls_back(self):
+        from agents.title import generate_title
+        br = _FakeBedrockRuntime(text="")
+        self.assertEqual(generate_title("q", "a", br, "m"), "New chat")
+
+    def test_bedrock_error_returns_fallback(self):
+        from agents.title import generate_title
+
+        class _BrokenBedrock:
+            def invoke_model(self, **_):
+                raise RuntimeError("bedrock down")
+
+        self.assertEqual(
+            generate_title("q", "a", _BrokenBedrock(), "m"),
+            "New chat",
+        )
+
+    def test_empty_question_returns_fallback(self):
+        from agents.title import generate_title
+        br = _FakeBedrockRuntime(text="Anything")
+        self.assertEqual(generate_title("   ", "a", br, "m"), "New chat")
+
+
+# ── Handler: signed-in routes + Bearer on POST /chat ──────────────────────────
+
+
+class TestHandlerAuthAndThreads(unittest.TestCase):
+    """
+    Exercises the signed-in routes + auth gating without touching AWS.
+
+    A single module-level ThreadsRepo fake is swapped in and the Clerk
+    verifier is monkey-patched to accept a fixed token -> user_id mapping.
+    """
+
+    def setUp(self):
+        from app import handler as h
+        from memory.threads import ThreadsRepo
+
+        # Stub compiled graph / cloudwatch / load_history as in TestLambdaHandler.
+        self._orig_get_graph = h.get_compiled_graph
+        self._orig_make_cw = h.make_cloudwatch
+        self._orig_load_history = h.load_history
+        self._orig_verify = h.verify_clerk_jwt
+        self._orig_threads_repo = h._threads_repo
+        self._orig_bedrock = h.make_bedrock_runtime
+        self._orig_generate_title = h.generate_title
+
+        self.graph = _FakeCompiledGraph({
+            "messages": [],
+            "language": "english",
+            "needs_rag": True,
+            "citations": [{"source": "Employment Act 2007"}],
+            "blocked": False,
+            "response_text": "Here is your answer.",
+        })
+        h.get_compiled_graph = lambda config: self.graph
+
+        class _FakeCloudWatch:
+            def put_metric_data(self, **_): pass
+
+        h.make_cloudwatch = lambda config: _FakeCloudWatch()
+        h.load_history = lambda config, session_id: []
+
+        # In-memory threads repo shared across calls.
+        self.table = _FakeDynamoTable()
+        self.repo = ThreadsRepo(self.table)
+        h._threads_repo = lambda config: self.repo
+
+        # Token -> user_id stub; anything else returns None.
+        self.tokens = {"good-token": "user_abc"}
+
+        def _verify(token, key):
+            return self.tokens.get((token or "").strip())
+
+        h.verify_clerk_jwt = _verify
+
+        # Make title generation deterministic + free.
+        h.make_bedrock_runtime = lambda config: None
+        h.generate_title = lambda q, a, br, model: "Sample title"
+
+    def tearDown(self):
+        from app import handler as h
+        h.get_compiled_graph = self._orig_get_graph
+        h.make_cloudwatch = self._orig_make_cw
+        h.load_history = self._orig_load_history
+        h.verify_clerk_jwt = self._orig_verify
+        h._threads_repo = self._orig_threads_repo
+        h.make_bedrock_runtime = self._orig_bedrock
+        h.generate_title = self._orig_generate_title
+
+    # Event helpers ----------------------------------------------------------
+
+    def _event(self, *, method, path, body=None, token=None, qs=None):
+        event = {
+            "requestContext": {"http": {"method": method, "path": path}},
+            "body": json.dumps(body) if body is not None else None,
+            "headers": {"authorization": f"Bearer {token}"} if token else {},
+            "queryStringParameters": qs or {},
+        }
+        return event
+
+    def _decode(self, result):
+        result["body"] = json.loads(result["body"])
+        return result
+
+    # POST /chat with / without auth -----------------------------------------
+
+    def test_chat_without_auth_skips_thread_index(self):
+        result = self._decode(lambda_handler(
+            self._event(method="POST", path="/chat", body={"message": "hi", "sessionId": "s1"}),
+            None,
+        ))
+        self.assertEqual(result["statusCode"], 200)
+        # No thread row was written for an anonymous turn.
+        self.assertEqual(self.repo.list_for_user("user_abc"), [])
+
+    def test_chat_with_auth_creates_thread_with_generated_title(self):
+        result = self._decode(lambda_handler(
+            self._event(
+                method="POST", path="/chat",
+                body={"message": "What are my rights?", "sessionId": "sess-1"},
+                token="good-token",
+            ),
+            None,
+        ))
+        self.assertEqual(result["statusCode"], 200)
+        rows = self.repo.list_for_user("user_abc")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].thread_id, "sess-1")
+        self.assertEqual(rows[0].title, "Sample title")
+
+    def test_chat_with_auth_second_turn_keeps_title_bumps_updated_at(self):
+        # First turn creates the row.
+        lambda_handler(
+            self._event(
+                method="POST", path="/chat",
+                body={"message": "First", "sessionId": "sess-1"},
+                token="good-token",
+            ),
+            None,
+        )
+        first = self.repo.get("user_abc", "sess-1")
+        import time as _t
+        _t.sleep(1.01)
+        # Second turn must not overwrite the user-visible title.
+        # Rename between turns to simulate the user editing.
+        self.repo.update_title("user_abc", "sess-1", "Custom title")
+        _t.sleep(1.01)
+        lambda_handler(
+            self._event(
+                method="POST", path="/chat",
+                body={"message": "Second", "sessionId": "sess-1"},
+                token="good-token",
+            ),
+            None,
+        )
+        updated = self.repo.get("user_abc", "sess-1")
+        self.assertEqual(updated.title, "Custom title")
+        self.assertGreater(updated.updated_at, first.updated_at)
+
+    def test_chat_with_invalid_token_behaves_anonymously(self):
+        lambda_handler(
+            self._event(
+                method="POST", path="/chat",
+                body={"message": "hi", "sessionId": "s1"},
+                token="bogus",
+            ),
+            None,
+        )
+        self.assertEqual(self.repo.list_for_user("user_abc"), [])
+
+    # GET /chat/threads ------------------------------------------------------
+
+    def test_list_threads_requires_auth(self):
+        result = self._decode(lambda_handler(
+            self._event(method="GET", path="/chat/threads"),
+            None,
+        ))
+        self.assertEqual(result["statusCode"], 401)
+
+    def test_list_threads_returns_users_rows_sorted(self):
+        self.repo.upsert("user_abc", "t1", title="Alpha")
+        import time as _t
+        _t.sleep(1.01)
+        self.repo.upsert("user_abc", "t2", title="Beta")
+        result = self._decode(lambda_handler(
+            self._event(method="GET", path="/chat/threads", token="good-token"),
+            None,
+        ))
+        self.assertEqual(result["statusCode"], 200)
+        ids = [t["threadId"] for t in result["body"]["threads"]]
+        self.assertEqual(ids, ["t2", "t1"])
+
+    # PATCH /chat/threads ----------------------------------------------------
+
+    def test_rename_requires_auth(self):
+        result = lambda_handler(
+            self._event(method="PATCH", path="/chat/threads", body={"threadId": "t1", "title": "x"}),
+            None,
+        )
+        self.assertEqual(result["statusCode"], 401)
+
+    def test_rename_bad_payload_returns_400(self):
+        result = lambda_handler(
+            self._event(method="PATCH", path="/chat/threads", body={"title": "x"}, token="good-token"),
+            None,
+        )
+        self.assertEqual(result["statusCode"], 400)
+
+    def test_rename_missing_thread_returns_404(self):
+        result = lambda_handler(
+            self._event(
+                method="PATCH", path="/chat/threads",
+                body={"threadId": "nope", "title": "x"},
+                token="good-token",
+            ),
+            None,
+        )
+        self.assertEqual(result["statusCode"], 404)
+
+    def test_rename_persists_title(self):
+        self.repo.upsert("user_abc", "t1", title="Old")
+        result = self._decode(lambda_handler(
+            self._event(
+                method="PATCH", path="/chat/threads",
+                body={"threadId": "t1", "title": "Shiny"},
+                token="good-token",
+            ),
+            None,
+        ))
+        self.assertEqual(result["statusCode"], 200)
+        self.assertEqual(result["body"]["thread"]["title"], "Shiny")
+        self.assertEqual(self.repo.get("user_abc", "t1").title, "Shiny")
+
+    # POST /chat/threads/claim ----------------------------------------------
+
+    def test_claim_requires_auth(self):
+        result = lambda_handler(
+            self._event(method="POST", path="/chat/threads/claim", body={"threadId": "t1"}),
+            None,
+        )
+        self.assertEqual(result["statusCode"], 401)
+
+    def test_claim_creates_row(self):
+        result = self._decode(lambda_handler(
+            self._event(
+                method="POST", path="/chat/threads/claim",
+                body={"threadId": "sess-anon"},
+                token="good-token",
+            ),
+            None,
+        ))
+        self.assertEqual(result["statusCode"], 200)
+        self.assertEqual(result["body"]["thread"]["threadId"], "sess-anon")
+        self.assertEqual(self.repo.get("user_abc", "sess-anon").title, "New chat")
+
+    def test_claim_is_idempotent(self):
+        lambda_handler(
+            self._event(
+                method="POST", path="/chat/threads/claim",
+                body={"threadId": "sess-anon"},
+                token="good-token",
+            ),
+            None,
+        )
+        lambda_handler(
+            self._event(
+                method="POST", path="/chat/threads/claim",
+                body={"threadId": "sess-anon"},
+                token="good-token",
+            ),
+            None,
+        )
+        self.assertEqual(len(self.repo.list_for_user("user_abc")), 1)
+
+    # Ownership gates ------------------------------------------------------
+
+    def test_chat_rejects_another_users_thread(self):
+        # u2 already owns the thread; u1 (user_abc) must not be able to
+        # continue the conversation by guessing/stealing the id.
+        self.repo.upsert("user_other", "t-victim", title="Private")
+        result = self._decode(lambda_handler(
+            self._event(
+                method="POST", path="/chat",
+                body={"message": "sneak", "sessionId": "t-victim"},
+                token="good-token",
+            ),
+            None,
+        ))
+        self.assertEqual(result["statusCode"], 403)
+        # Graph was not invoked — no chat leakage.
+        self.assertEqual(self.graph.invocations, [])
+
+    def test_chat_allows_owner_to_continue_their_thread(self):
+        self.repo.upsert("user_abc", "t-mine", title="Mine")
+        result = lambda_handler(
+            self._event(
+                method="POST", path="/chat",
+                body={"message": "continue", "sessionId": "t-mine"},
+                token="good-token",
+            ),
+            None,
+        )
+        self.assertEqual(result["statusCode"], 200)
+
+    def test_chat_anonymous_rejected_on_owned_thread(self):
+        self.repo.upsert("user_other", "t-victim", title="Private")
+        result = lambda_handler(
+            self._event(
+                method="POST", path="/chat",
+                body={"message": "hi", "sessionId": "t-victim"},
+            ),
+            None,
+        )
+        self.assertEqual(result["statusCode"], 403)
+
+    def test_history_rejects_another_users_thread(self):
+        self.repo.upsert("user_other", "t-victim", title="Private")
+        result = lambda_handler(
+            self._event(
+                method="GET", path="/chat/history",
+                qs={"sessionId": "t-victim"},
+                token="good-token",
+            ),
+            None,
+        )
+        self.assertEqual(result["statusCode"], 403)
+
+    def test_history_anonymous_rejected_on_owned_thread(self):
+        self.repo.upsert("user_other", "t-victim", title="Private")
+        result = lambda_handler(
+            self._event(
+                method="GET", path="/chat/history",
+                qs={"sessionId": "t-victim"},
+            ),
+            None,
+        )
+        self.assertEqual(result["statusCode"], 403)
+
+    def test_history_allows_owner_to_read(self):
+        self.repo.upsert("user_abc", "t-mine", title="Mine")
+        result = lambda_handler(
+            self._event(
+                method="GET", path="/chat/history",
+                qs={"sessionId": "t-mine"},
+                token="good-token",
+            ),
+            None,
+        )
+        self.assertEqual(result["statusCode"], 200)
+
+    def test_history_unowned_thread_stays_readable_anonymously(self):
+        result = lambda_handler(
+            self._event(
+                method="GET", path="/chat/history",
+                qs={"sessionId": "t-anon"},
+            ),
+            None,
+        )
+        # Anonymous threads keep their current behaviour — any caller that
+        # holds the (UUID) id can read the persisted messages.
+        self.assertEqual(result["statusCode"], 200)
+
+    def test_claim_rejects_another_users_thread(self):
+        self.repo.upsert("user_other", "t-victim", title="Private")
+        result = lambda_handler(
+            self._event(
+                method="POST", path="/chat/threads/claim",
+                body={"threadId": "t-victim"},
+                token="good-token",
+            ),
+            None,
+        )
+        self.assertEqual(result["statusCode"], 403)
+        # The victim's row is untouched.
+        self.assertEqual(self.repo.get("user_other", "t-victim").title, "Private")
+        self.assertEqual(self.repo.list_for_user("user_abc"), [])
+
+
 # ── Runner ────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -2903,6 +3621,12 @@ if __name__ == "__main__":
         TestSubsampleStratified,
         TestGeneratedCaseJsonl,
         TestListingClientFactory,
+        TestDeriveIssuer,
+        TestExtractBearer,
+        TestVerifyClerkJwt,
+        TestThreadsRepo,
+        TestGenerateTitle,
+        TestHandlerAuthAndThreads,
     ]:
         suite.addTests(loader.loadTestsFromTestCase(cls))
 

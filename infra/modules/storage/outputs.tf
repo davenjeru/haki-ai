@@ -21,3 +21,11 @@ output "checkpoints_table_name" {
 output "checkpoints_table_arn" {
   value = aws_dynamodb_table.checkpoints.arn
 }
+
+output "chat_threads_table_name" {
+  value = aws_dynamodb_table.chat_threads.name
+}
+
+output "chat_threads_table_arn" {
+  value = aws_dynamodb_table.chat_threads.arn
+}

@@ -215,6 +215,37 @@ Return the merged answer as plain prose. Do NOT wrap it in JSON or markdown \
 code fences. Do NOT restate the user's question."""
 
 
+# ── Title generator (Phase 7 signed-in threads) ──────────────────────────────
+# Called once per thread when a signed-in user finishes their first turn.
+# Returns a short human-readable title for the sidebar. The model never sees
+# the citations — it only sees the user's question + the assistant's reply so
+# the title reflects the conversation topic, not the source metadata.
+
+TITLE_GENERATOR_PROMPT = """You label Kenyan legal-aid chat threads.
+
+Read the user's question and the assistant's reply, then write a very short
+title (at most 6 words, no trailing punctuation) that captures the topic in
+the SAME language as the user's question. No quotes, no emojis, no prefixes
+like "Chat about" or "Question:". If the conversation is off-topic or a
+refusal, return "New chat".
+
+Return the title as a single line of plain text, nothing else.
+
+Examples:
+  Q: "What are my rights if fired without notice?"
+  A: "Under the Employment Act 2007, Section 40..."
+  -> Termination without notice rights
+
+  Q: "Sheria ya ajira inasema nini kuhusu kufukuzwa?"
+  A: "Kwa mujibu wa Sheria ya Ajira ya 2007..."
+  -> Kufukuzwa kazini kisheria
+
+  Q: "How's the weather?"
+  A: "Mimi ni msaidizi wa kisheria wa Kenya tu..."
+  -> New chat
+"""
+
+
 # ── LLM-as-judge prompt (Phase 3 evals) ──────────────────────────────────────
 
 JUDGE_PROMPT = """You are a strict evaluator for a Kenyan legal aid chatbot.

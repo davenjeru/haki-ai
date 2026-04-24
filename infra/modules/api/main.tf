@@ -15,7 +15,7 @@ resource "aws_apigatewayv2_api" "chat" {
 
   cors_configuration {
     allow_origins = ["*"]
-    allow_methods = ["GET", "POST", "OPTIONS"]
+    allow_methods = ["GET", "POST", "PATCH", "OPTIONS"]
     allow_headers = ["Content-Type", "Authorization"]
     max_age       = 300
   }
@@ -48,6 +48,31 @@ resource "aws_apigatewayv2_route" "chat" {
 resource "aws_apigatewayv2_route" "chat_history" {
   api_id    = aws_apigatewayv2_api.chat.id
   route_key = "GET /chat/history"
+  target    = "integrations/${aws_apigatewayv2_integration.lambda.id}"
+}
+
+# ── Routes: /chat/threads (signed-in only) ─────────────────────────────────────
+# The thread index powers the "your chats" sidebar and only responds to
+# requests that carry a verified Clerk session JWT. The Lambda rejects with
+# 401 when the Bearer header is missing or invalid; API Gateway is not
+# configured with a JWT authorizer because Clerk instances are per-app and
+# we want the publishable-key-derived verification to stay in one place.
+
+resource "aws_apigatewayv2_route" "chat_threads_list" {
+  api_id    = aws_apigatewayv2_api.chat.id
+  route_key = "GET /chat/threads"
+  target    = "integrations/${aws_apigatewayv2_integration.lambda.id}"
+}
+
+resource "aws_apigatewayv2_route" "chat_threads_rename" {
+  api_id    = aws_apigatewayv2_api.chat.id
+  route_key = "PATCH /chat/threads"
+  target    = "integrations/${aws_apigatewayv2_integration.lambda.id}"
+}
+
+resource "aws_apigatewayv2_route" "chat_threads_claim" {
+  api_id    = aws_apigatewayv2_api.chat.id
+  route_key = "POST /chat/threads/claim"
   target    = "integrations/${aws_apigatewayv2_integration.lambda.id}"
 }
 

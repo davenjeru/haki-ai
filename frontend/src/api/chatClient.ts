@@ -1,3 +1,4 @@
+import { authedFetch } from '../lib/authedFetch'
 import type { ChatMessage, ChatResponse, Citation, DetectedLanguage } from '../types/chat'
 
 const BLOCKED_COPY =
@@ -56,6 +57,18 @@ export function resetChatSession(): string {
   currentSessionId = generateSessionId()
   writeStoredSessionId(currentSessionId)
   return currentSessionId
+}
+
+/**
+ * Switches to an existing thread (e.g. when the user clicks a row in the
+ * thread sidebar). Persists the id so a refresh sticks to the selected
+ * thread.
+ */
+export function setSessionId(sessionId: string): void {
+  const trimmed = (sessionId || '').trim()
+  if (!trimmed) return
+  currentSessionId = trimmed
+  writeStoredSessionId(trimmed)
 }
 
 function isRecord(v: unknown): v is Record<string, unknown> {
@@ -183,7 +196,7 @@ export async function sendChatMessage(message: string): Promise<ChatResponse> {
   const path = import.meta.env.VITE_CHAT_PATH ?? '/chat'
   const url = `${base}${path.startsWith('/') ? path : `/${path}`}`
 
-  const res = await fetch(url, {
+  const res = await authedFetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ message: trimmed, sessionId: currentSessionId }),
@@ -240,7 +253,7 @@ export async function fetchChatHistory(sessionId: string): Promise<ChatMessage[]
   const base = apiBase()
   if (base === undefined) return []
   const url = `${base}/chat/history?sessionId=${encodeURIComponent(sessionId)}`
-  const res = await fetch(url, { method: 'GET' })
+  const res = await authedFetch(url, { method: 'GET' })
   if (!res.ok) {
     // Brand-new sessions return 200 with an empty list; a non-2xx here means
     // something else went wrong. Swallow the error so an offline backend

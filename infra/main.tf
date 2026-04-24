@@ -114,6 +114,9 @@ module "compute" {
   chroma_port                  = var.chroma_port
   checkpoints_table_name       = module.storage.checkpoints_table_name
   checkpoints_table_arn        = module.storage.checkpoints_table_arn
+  chat_threads_table_name      = module.storage.chat_threads_table_name
+  chat_threads_table_arn       = module.storage.chat_threads_table_arn
+  clerk_publishable_key        = var.clerk_publishable_key
   data_bucket_arn              = module.storage.data_bucket_arn
   data_bucket_name             = module.storage.data_bucket_id
   ingestion_kb_id              = local.is_local ? "" : module.ai[0].knowledge_base_id

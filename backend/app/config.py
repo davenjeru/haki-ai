@@ -23,8 +23,14 @@ class Config:
     chroma_port: int
     s3_bucket: str
     checkpoints_table: str
+    chat_threads_table: str
     environment: str
     langsmith_ssm_parameter: str
+    # Clerk publishable key (browser-safe). Used by the backend solely to
+    # auto-derive the issuer + JWKS URL for JWT verification — no server-
+    # side secret is required for RS256 verification since the JWKS is
+    # public. Empty string disables signed-in-only routes.
+    clerk_publishable_key: str
 
 
 def load_config() -> Config:
@@ -59,6 +65,9 @@ def load_config() -> Config:
         chroma_port=int(os.environ.get("CHROMA_PORT", "8000")),
         s3_bucket=os.environ.get("S3_BUCKET", "haki-ai-data"),
         checkpoints_table=os.environ.get("CHECKPOINTS_TABLE", "haki-ai-checkpoints"),
+        chat_threads_table=os.environ.get("CHAT_THREADS_TABLE", "haki-ai-chat-threads"),
         environment=env,
         langsmith_ssm_parameter=os.environ.get("LANGSMITH_API_KEY_SSM_PARAMETER", ""),
+        clerk_publishable_key=os.environ.get("CLERK_PUBLISHABLE_KEY", "")
+        or os.environ.get("VITE_CLERK_PUBLISHABLE_KEY", ""),
     )

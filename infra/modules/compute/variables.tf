@@ -22,6 +22,21 @@ variable "checkpoints_table_arn" {
   type        = string
 }
 
+variable "chat_threads_table_name" {
+  description = "DynamoDB table holding the per-user thread index (signed-in sidebar)."
+  type        = string
+}
+variable "chat_threads_table_arn" {
+  description = "ARN of the chat-threads DynamoDB table (used for scoping IAM)."
+  type        = string
+}
+
+variable "clerk_publishable_key" {
+  description = "Clerk publishable key. The backend uses it to auto-derive the issuer and JWKS URL for JWT verification."
+  type        = string
+  default     = ""
+}
+
 variable "data_bucket_arn" {
   description = "ARN of the S3 data bucket. Lambda needs GetObject on page-images/* so presigned citation URLs resolve."
   type        = string

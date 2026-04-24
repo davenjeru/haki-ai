@@ -141,3 +141,47 @@ resource "aws_dynamodb_table" "checkpoints" {
     }
   }
 }
+
+# ── Signed-in chat thread index (DynamoDB) ────────────────────────────────────
+# Per-user catalogue of (threadId, title, timestamps) that powers the "your
+# chats" sidebar. Rows are tiny (<256 B) and bounded per user, so a plain
+# Query by user_id is enough — no GSIs required.
+
+resource "aws_dynamodb_table" "chat_threads" {
+  name         = "${var.project_name}-chat-threads"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "user_id"
+  range_key    = "thread_id"
+
+  attribute {
+    name = "user_id"
+    type = "S"
+  }
+
+  attribute {
+    name = "thread_id"
+    type = "S"
+  }
+
+  # Ownership lookup index. Every request that touches someone else's
+  # thread_id (claim, chat POST, history GET) needs to know "does any
+  # user already own this id?" in O(1). A GSI keyed on thread_id alone
+  # gives us that without a full table scan.
+  global_secondary_index {
+    name            = "thread_id_index"
+    hash_key        = "thread_id"
+    projection_type = "KEYS_ONLY"
+  }
+
+  ttl {
+    attribute_name = "expires_at"
+    enabled        = true
+  }
+
+  dynamic "point_in_time_recovery" {
+    for_each = var.is_local ? [] : [1]
+    content {
+      enabled = true
+    }
+  }
+}

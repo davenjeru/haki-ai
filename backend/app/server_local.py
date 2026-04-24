@@ -55,8 +55,10 @@ def _load_dotenv(path: str) -> None:
                 os.environ[key] = value
 
 
-# Project-root .env (where LANGSMITH_* + LOCALSTACK_AUTH_TOKEN live).
-_load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
+# Project-root .env (where LANGSMITH_* + LOCALSTACK_AUTH_TOKEN + the Clerk
+# publishable key live). `__file__` is backend/app/server_local.py, so the
+# project root is two levels up.
+_load_dotenv(os.path.join(os.path.dirname(__file__), "..", "..", ".env"))
 
 # Must be set before importing handler so load_config() picks it up
 os.environ.setdefault("ENV", "local")
@@ -72,44 +74,53 @@ PORT = int(os.environ.get("PORT", 8080))
 
 
 class _Handler(BaseHTTPRequestHandler):
-    def do_POST(self):
-        if self.path != "/chat":
-            self._send(404, {"error": "Not found"})
-            return
+    """
+    Thin HTTP shell that forwards every request to the Lambda handler. The
+    handler itself owns routing — adding a new endpoint only requires
+    editing `handler.py`, not this file.
+    """
 
-        length = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(length).decode("utf-8")
-
-        result = lambda_handler(
-            {"body": body, "method": "POST", "path": "/chat"}, None,
-        )
-        self._forward(result)
-
-    def do_GET(self):
+    def _dispatch(self, method: str) -> None:
         from urllib.parse import urlparse, parse_qs
 
         parsed = urlparse(self.path)
-        if parsed.path.rstrip("/") != "/chat/history":
-            self._send(404, {"error": "Not found"})
-            return
         qs = parse_qs(parsed.query)
         params = {k: v[0] for k, v in qs.items()}
-        result = lambda_handler(
-            {
-                "method": "GET",
-                "path": "/chat/history",
-                "queryStringParameters": params,
-            },
-            None,
-        )
+
+        length = int(self.headers.get("Content-Length", 0) or 0)
+        body = self.rfile.read(length).decode("utf-8") if length else ""
+
+        # Mirror API Gateway v2's header-case normalisation so the
+        # handler's `extract_bearer` sees the same keys it would in prod.
+        headers = {k.lower(): v for k, v in self.headers.items()}
+
+        event = {
+            "requestContext": {"http": {"method": method, "path": parsed.path}},
+            "body": body or None,
+            "headers": headers,
+            "queryStringParameters": params,
+        }
+        result = lambda_handler(event, None)
         self._forward(result)
+
+    def do_POST(self):
+        self._dispatch("POST")
+
+    def do_GET(self):
+        self._dispatch("GET")
+
+    def do_PATCH(self):
+        self._dispatch("PATCH")
+
+    def do_DELETE(self):
+        self._dispatch("DELETE")
 
     def do_OPTIONS(self):
         # Handle CORS preflight so browser fetch works without the Vite proxy
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
         self.end_headers()
 
     def _forward(self, result):
